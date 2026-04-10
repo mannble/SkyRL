@@ -79,7 +79,7 @@ agent:
 # See: harbor.models.trial.config.EnvironmentConfig
 environment:
   # Environment type. Options: daytona, docker, e2b, modal, runloop, gke
-  type: daytona
+  type: docker
 
   # Resource overrides (optional)
   override_cpus: 1
