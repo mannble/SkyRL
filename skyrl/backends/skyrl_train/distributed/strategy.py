@@ -129,14 +129,54 @@ class DistributedStrategy(ABC):
 
             if hasattr(model_config, "name_or_path") and model_config.name_or_path:
                 try:
-                    # Some model's name_or_path is empty if not initialized from pretrained,
-                    # in this cases, we don't save generation config.
                     generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
-                    # with io.local_work_dir(hf_config_tokenizer_path) as work_dir:
                     generation_config.save_pretrained(work_dir)
                 except Exception as e:
-                    # if the generation config isn't available, we don't save it
                     logger.warning(f"Could not save generation config for '{model_config.name_or_path}'. Error: {e}")
+
+                self._copy_missing_configs(model_config.name_or_path, work_dir)
+
+    @staticmethod
+    def _copy_missing_configs(source_model_dir: str, target_dir: str):
+        """Copy auxiliary config files that save_pretrained does not produce.
+
+        Multimodal models (e.g. Qwen3.5-VL) ship preprocessor configs and
+        legacy tokenizer files that are not written by
+        ``config.save_pretrained()`` or ``tokenizer.save_pretrained()``.
+        Without them vLLM / other inference engines may fail to load the model.
+        """
+        import os
+        import shutil
+
+        _AUX_FILES = [
+            "preprocessor_config.json",
+            "video_preprocessor_config.json",
+            "merges.txt",
+            "vocab.json",
+            "generation_config.json",
+        ]
+
+        if not os.path.isdir(source_model_dir):
+            return
+
+        for filename in _AUX_FILES:
+            src = os.path.join(source_model_dir, filename)
+            dst = os.path.join(target_dir, filename)
+            if os.path.isfile(src) and not os.path.isfile(dst):
+                shutil.copy2(src, dst)
+                logger.debug(f"Copied {filename} from {source_model_dir} to {target_dir}")
+
+        src_tok_cfg = os.path.join(source_model_dir, "tokenizer_config.json")
+        dst_tok_cfg = os.path.join(target_dir, "tokenizer_config.json")
+        if os.path.isfile(src_tok_cfg) and os.path.isfile(dst_tok_cfg):
+            src_size = os.path.getsize(src_tok_cfg)
+            dst_size = os.path.getsize(dst_tok_cfg)
+            if src_size > dst_size * 2:
+                shutil.copy2(src_tok_cfg, dst_tok_cfg)
+                logger.debug(
+                    f"Replaced tokenizer_config.json with original "
+                    f"({dst_size}B -> {src_size}B, preserves added_tokens_decoder)"
+                )
 
     @staticmethod
     def get_rng_state():

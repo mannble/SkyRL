@@ -288,6 +288,13 @@ class RayPPOTrainer:
                     with Timer("train_critic_and_policy", self.all_timings):
                         status = self.train_critic_and_policy(training_input)
 
+                    # 7.5 Meta-RL mini training step (if meta samples available)
+                    meta_batch = getattr(self.generator, "_pending_meta_batch", None)
+                    if meta_batch is not None:
+                        self.generator._pending_meta_batch = None
+                        with Timer("meta_train_step", self.all_timings):
+                            self._meta_training_step(meta_batch)
+
                     # 8. conditionally save checkpoints and hf model
                     if self.cfg.trainer.ckpt_interval > 0 and self.global_step % self.cfg.trainer.ckpt_interval == 0:
                         with Timer("save_checkpoints", self.all_timings):
@@ -1162,6 +1169,79 @@ class RayPPOTrainer:
         self.dispatch.empty_cache()
 
         return policy_status
+
+    @torch.no_grad()
+    def _meta_training_step(self, meta_batch: dict) -> None:
+        """Run a separate mini RL training step on meta-learning samples.
+
+        Reuses the full trainer pipeline (convert -> fwd logprobs -> GRPO
+        advantages -> policy gradient) but on a small batch of meta-reasoning
+        samples, completely independent from the main task training batch.
+        """
+        from skyrl.train.generators.base import GeneratorOutput
+        import math
+
+        n = len(meta_batch["response_ids"])
+        if n == 0:
+            return
+
+        n_samples = self.cfg.generator.n_samples_per_prompt
+        mini_bs = self.cfg.trainer.policy_mini_batch_size * n_samples
+        target_n = max(mini_bs, math.ceil(n / mini_bs) * mini_bs)
+        pad_count = target_n - n
+
+        def _pad_list(lst, pad_count):
+            if pad_count <= 0 or not lst:
+                return lst
+            return lst + [lst[-1]] * pad_count
+
+        meta_uids = [f"meta_cycle_{self.global_step}"] * target_n
+
+        meta_output: GeneratorOutput = {
+            "prompt_token_ids": _pad_list(meta_batch["prompt_token_ids"], pad_count),
+            "response_ids": _pad_list(meta_batch["response_ids"], pad_count),
+            "rewards": _pad_list(meta_batch["rewards"], pad_count),
+            "loss_masks": _pad_list(meta_batch["loss_masks"], pad_count),
+            "stop_reasons": _pad_list(meta_batch.get("stop_reasons") or [], pad_count) or None,
+            "rollout_metrics": None,
+            "rollout_logprobs": meta_batch.get("rollout_logprobs"),
+        }
+
+        if pad_count > 0:
+            for i in range(n, target_n):
+                meta_output["loss_masks"][i] = [0] * len(meta_output["loss_masks"][i])
+                meta_output["rewards"][i] = 0.0 if isinstance(meta_output["rewards"][i], (int, float)) else [0.0] * len(meta_output["rewards"][i])
+
+        # Save main-batch reward metrics before postprocess overwrites them
+        saved_reward_keys = {k: v for k, v in self.all_metrics.items() if k.startswith("reward/")}
+
+        meta_output = self.postprocess_generator_output(meta_output, meta_uids)
+
+        # Move meta reward metrics to meta_rl/ prefix, restore main-batch metrics
+        for k in list(self.all_metrics):
+            if k.startswith("reward/"):
+                self.all_metrics[f"meta_rl/{k}"] = self.all_metrics.pop(k)
+        self.all_metrics.update(saved_reward_keys)
+
+        training_input = self.convert_to_training_input(meta_output, meta_uids)
+
+        training_input = self.fwd_logprobs_values_reward(training_input)
+
+        if self.cfg.trainer.algorithm.use_kl_in_reward:
+            training_input = self.apply_reward_kl_penalty(training_input)
+
+        training_input = self.compute_advantages_and_returns(training_input)
+        for key in ["rewards"]:
+            training_input.pop(key)
+        training_input.metadata.pop("uids")
+
+        status = self.train_critic_and_policy(training_input)
+
+        meta_metrics = {f"meta_rl/{k}": v for k, v in status.items()}
+        self.all_metrics.update(meta_metrics)
+        self.all_metrics["meta_rl/batch_size"] = n
+        self.all_metrics["meta_rl/padded_to"] = target_n
+        logger.info(f"Meta-RL mini step done: {n} samples (padded to {target_n}), policy_loss={status.get('total_loss', 'N/A')}")
 
     def handle_dynamic_sampling(
         self, generator_output: GeneratorOutput, uids: List[str]

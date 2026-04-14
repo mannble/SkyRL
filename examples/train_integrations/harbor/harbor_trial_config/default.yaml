@@ -14,9 +14,6 @@
 # And a full list of fields that TrialConfig supports:
 # https://github.com/laude-institute/harbor/blob/5921cc40e8f6b5b0df0a3dc6354e0e679447eb54/src/harbor/models/trial/config.py
 
-# Harbor TrialConfig fields below
-# --------------------------------
-
 # Where to store trial logging outputs
 trials_dir: ~/trials
 
@@ -26,7 +23,7 @@ timeout_multiplier: 1.0
 # Agent configuration
 # See: harbor.models.trial.config.AgentConfig
 agent:
-  # Agent name. Options: terminus-2, terminus-1, terminus, oracle, claude-code,
+  # Agent name. Options: terminus-2, oracle, claude-code,
   # aider, swe-agent, openhands, etc.
   name: terminus-2
 
@@ -60,17 +57,11 @@ agent:
       output_cost_per_token: 0.0
 
     # Additional kwargs passed through to LiteLLM's acompletion() call.
-    # These are forwarded via Terminus2 -> LiteLLM -> litellm.acompletion(**kwargs).
-    # Any parameter that litellm.acompletion() accepts can be set here, including:
-    #   - timeout: LLM request timeout in seconds (default: litellm's 600s)
-    #   - max_retries: Number of retries at the OpenAI SDK level (default: 2)
-    #   - top_p, top_k, frequency_penalty, presence_penalty, etc.
     llm_kwargs:
-      # LLM request timeout in seconds. Higher values prevent premature retries.
+      # LLM request timeout in seconds
       timeout: 900
       # Set to 0 to disable OpenAI SDK retries from LiteLLM.
       max_retries: 0
-      # Sampling params that directly get passed to LiteLLM's acompletion() call.
       top_p: 1.0
       top_k: -1
       min_p: 0.0
@@ -87,10 +78,8 @@ environment:
   override_storage_mb: 1024
   suppress_override_warnings: true
 
-  # Environment-specific settings
   kwargs:
-    # sandbox_timeout_secs: 1800 # Modal-specific. Timeout of the sandbox after which it is automatically stopped.
-    auto_stop_interval_mins: 30 # Daytona-specific. Minutes of inactivity before the sandbox is automatically stopped.
+    auto_stop_interval_mins: 30
 
 
 # Verifier configuration
@@ -99,5 +88,16 @@ verifier:
   # Set to true to skip verification (useful for debugging)
   disable: false
 
-  # Override the verifier timeout (seconds)
-  # override_timeout_sec: 300
+# -----------------------------------------------------------------
+# Meta-learning closed-loop configuration
+# These fields are read by HarborGenerator, NOT by Harbor Trial.
+# Pass them via Hydra command line:
+#   generator.meta.enabled=true generator.meta.interval_batches=20 ...
+# -----------------------------------------------------------------
+# meta:
+#   enabled: true
+#   interval_batches: 20    # Run meta cycle every N generator batches
+#   max_candidates: 2       # Max patch candidates per meta cycle
+#   canary_num_tasks: 4     # Tasks for canary evaluation
+#   override_base: /home/ray/SkyRL/examples/train_integrations/harbor/meta_patches/terminus2
+#   log_dir: /tmp/skyrl-logs

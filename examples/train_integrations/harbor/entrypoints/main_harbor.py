@@ -2,12 +2,20 @@
 Main entrypoint for training on Harbor tasks.
 """
 
+import os
 import sys
+from pathlib import Path
+
+# skyrl-agent is a sibling workspace; make it importable everywhere
+_SKYRL_ROOT = Path(__file__).resolve().parents[4]
+_AGENT_ROOT = str(_SKYRL_ROOT / "skyrl-agent")
+if _AGENT_ROOT not in sys.path:
+    sys.path.insert(0, _AGENT_ROOT)
+os.environ["SKYRL_AGENT_PATH"] = _AGENT_ROOT
 
 import ray
 import yaml
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Dict
 
 from skyrl.train.entrypoints.main_base import BasePPOExp
@@ -34,10 +42,29 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
 
 @dataclass
+class MetaLoopCLIConfig:
+    """CLI-passable meta-learning config (mirrors MetaLoopConfig in harbor_generator.py)."""
+
+    enabled: bool = True
+    interval_batches: int = 20
+    max_candidates: int = 4
+    canary_num_tasks: int = 4
+    canary_n_samples: int = 3
+    override_base: str = ""
+    log_dir: str = "/tmp/skyrl-logs"
+    llm_model: str = ""
+    llm_base_url: str = "http://localhost:8000/v1"
+    llm_api_key: str = ""
+    llm_temperature: float = 0.3
+    llm_max_tokens: int = 2048
+
+
+@dataclass
 class HarborGeneratorConfig(GeneratorConfig):
-    """GeneratorConfig with Harbor-specific rate limiting."""
+    """GeneratorConfig with Harbor-specific rate limiting and meta-learning."""
 
     rate_limit: RateLimiterConfig = field(default_factory=RateLimiterConfig)
+    meta: MetaLoopCLIConfig = field(default_factory=MetaLoopCLIConfig)
 
 
 @dataclass
@@ -91,7 +118,10 @@ class HarborExp(BasePPOExp):
 
 @ray.remote(num_cpus=1)
 def skyrl_entrypoint(cfg):
-    # make sure that the training loop is not run on the head node.
+    import os as _os, sys as _sys
+    _agent = _os.environ.get("SKYRL_AGENT_PATH", "")
+    if _agent and _agent not in _sys.path:
+        _sys.path.insert(0, _agent)
     exp = HarborExp(cfg)
     exp.run()
 
