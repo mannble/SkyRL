@@ -12,11 +12,11 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from skyrl_agent.meta_toolkit.diagnosis.rule_based_diagnoser import DiagnosisResult
 from skyrl_agent.meta_toolkit.editing.module_registry import ModuleRegistry
 from skyrl_agent.meta_toolkit.editing.patch_schema import (
-    ChangeType,
     PatchCandidate,
     PatchFileEdit,
 )
@@ -51,11 +51,17 @@ Access all fields as **attributes** (e.g. `context.episode`, NOT `context["episo
 | context.last_plan | str | LLM's plan text this round |
 | context.is_task_complete | bool | LLM marked task_complete this round |
 | context.original_instruction | str | The original task description |
+| context.last_terminal_output | str | Terminal output from the most recent command |
+| context.execution_history | list[dict] | Past rounds: [{"commands":[..], "output":"...", "episode":N}] (last 20) |
+| context.last_llm_response | str | Raw LLM response text before parsing |
+| context.forced_continue_count | int | Times force_continue was triggered so far |
 | context.kv | dict | **Writable** persistent store across rounds |
 
 ### context.kv usage (IMPORTANT)
 
 `context.kv` is the ONLY writable field. Use it to track state across rounds.
+When multiple hooks are active on the same hook point, each hook gets an
+isolated `context.kv` namespace to avoid key collisions.
 Always initialize with `setdefault` to avoid KeyError:
 
 ```python
@@ -106,15 +112,14 @@ def hook(command_keystrokes, terminal_output, context):
     return terminal_output + "\\n[TIMEOUT] Command timed out. Try a different approach."
 ```
 
-**on_parse_error**(raw_response: str, error: str, context) -> str|None
-```python
-def hook(raw_response, error, context):
-    return "Your response had a formatting error: " + error + ". Please use the correct JSON format."
-```
-
 **after_round**(terminal_output: str, is_task_complete: bool, context) -> dict
-The most powerful hook. Runs after every round. Return {{"inject": "text"}}
-to append text to the next observation, or {{}} for no-op.
+The most powerful hook. Runs after every round and may control the next LLM turn.
+Return fields (all optional):
+- `request_new_turn` (bool): ask for an extra turn, even when completion would end.
+- `next_prompt` (str): prompt content for the next turn.
+- `prompt_mode` ("append" | "replace"): how `next_prompt` is applied.
+- `inject` (str): backward-compatible alias for appending guidance text.
+- `force_continue` (bool): legacy alias for `request_new_turn`.
 
 NOTE on completion flow: when the agent outputs task_complete=true, terminus-2
 uses a two-step confirmation (agent must say task_complete twice in a row).
@@ -123,19 +128,23 @@ into the confirmation prompt. If your hook injects a verification reminder on
 the first task_complete, the agent will see it and can decide whether to
 confirm or continue working.
 
-Example — completion verification (inject verification prompt on first complete):
+Example — completion verification with explicit next-turn control:
 ```python
 def hook(terminal_output, is_task_complete, context):
     count = context.kv.setdefault("complete_count", 0)
     if is_task_complete:
         context.kv["complete_count"] = count + 1
         if count < 1:
-            return {{"inject": (
+            return {{
+                "request_new_turn": True,
+                "next_prompt": (
                 "[VERIFY] You said task_complete. Before confirming, please:\\n"
                 "1. Run the tests.\\n"
                 "2. Check the output matches the expected format.\\n"
                 "If all correct, submit task_complete again."
-            )}}
+                ),
+                "prompt_mode": "append",
+            }}
     else:
         context.kv["complete_count"] = 0
     return {{}}
@@ -150,11 +159,14 @@ def hook(terminal_output, is_task_complete, context):
     if len(history) > 20:
         history[:] = history[-20:]
     if len(history) >= 4 and history[-2:] == history[-4:-2]:
-        return {{"inject": (
+        return {{
+            "next_prompt": (
             "[LOOP DETECTED] You are repeating commands. "
             "Try a different approach. Task: "
             + context.original_instruction[:200]
-        )}}
+            ),
+            "prompt_mode": "append",
+        }}
     return {{}}
 ```
 """
@@ -182,9 +194,6 @@ async def _run_agent_loop(self, initial_prompt, chat, logging_dir, original_inst
         # 2. LLM interaction
         commands, is_task_complete, feedback, analysis, plan, llm_response = \\
             await self._handle_llm_interaction(chat, prompt, ...)
-        if feedback and "ERROR:" in feedback:
-            self._run_hook("on_parse_error", llm_response.content, feedback, context)
-            continue
         # 3. before_execute hook
         commands = self._run_hook("before_execute", commands, context)
         # 4. Execute commands in tmux
@@ -193,9 +202,9 @@ async def _run_agent_loop(self, initial_prompt, chat, logging_dir, original_inst
             self._run_hook("on_timeout", last_cmd, terminal_output, context)
         else:
             terminal_output = self._run_hook("after_execute", terminal_output, context)
-        # 5. after_round hook — returns dict; if {"inject": text}, appends text to observation
-        inject_text = await self._run_after_round_hook(terminal_output, is_task_complete)
-        if inject_text: terminal_output += "\\n\\n" + inject_text
+        # 5. after_round hook — can request extra turns and customize next prompt
+        control = await self._run_after_round_hook(terminal_output, is_task_complete)
+        if control.get("inject"): terminal_output += "\\n\\n" + control["inject"]
         # 6. Completion check (two-step confirmation)
         if is_task_complete:
             if self._pending_completion: return
@@ -206,8 +215,8 @@ async def _run_agent_loop(self, initial_prompt, chat, logging_dir, original_inst
 Key facts:
 - Commands execute serially in tmux; context.kv persists within a trial.
 - context.last_commands contains the keystrokes from the PREVIOUS step.
-- The after_round hook is the most powerful: if it returns {"inject": text},
-  that text is appended to the observation, giving the model extra guidance.
+- The after_round hook is the most powerful: it can request extra turns and
+  customize the next prompt (append or replace mode).
 
 **CRITICAL sandbox rules for hooks:**
 - Hooks run in an isolated namespace. You CANNOT use `Command(...)` or any
@@ -245,28 +254,22 @@ If traces show high wall-clock time relative to turn count:
   (e.g. `cd`, `ls`, `echo`, `cat` → 0.3s) and set reasonable defaults for
   build commands (e.g. `make`, `gcc` → 5-10s).
 
-### 4. Repeated errors → Error recovery
-If traces show high `tool_failures` or repeated parse errors:
-- Use an `on_parse_error` hook to construct a targeted recovery prompt that
-  tells the agent exactly what went wrong and how to fix the format.
-- Add strategies reminding the agent of the correct output schema.
-
-### 5. Stuck in loops → Loop detection via after_round
+### 4. Stuck in loops → Loop detection via after_round
 If traces show the agent repeating the same commands without progress:
 - Use an `after_round` hook that tracks command history in `context.kv`.
   When repeated patterns are detected, inject a warning suggesting a new
   approach. Alternatively use a `before_llm_call` hook for earlier detection.
 
-### 6. Poor planning → Strategic guidance
+### 5. Poor planning → Strategic guidance
 If traces show planning_failure or the agent taking many turns:
 - Add strategy_edits with task-decomposition advice (e.g. "Read the task
   fully before acting", "Verify each sub-goal before moving on").
 
-### 7. Timeout handling → Graceful recovery
+### 6. Timeout handling → Graceful recovery
 If traces show many timeouts:
 - Use an `on_timeout` hook to append recovery guidance to terminal output.
 
-### 8. Verification gaps → Post-step verification via after_round
+### 7. Verification gaps → Post-step verification via after_round
 If traces show tasks passing but with low reward (partial solutions):
 - Use an `after_round` hook to periodically inject reminders for the agent
   to verify its work (e.g. "Run the tests before proceeding").
@@ -285,8 +288,8 @@ The agent sees these as [LEARNED STRATEGIES] in its prompt.
 
 ### Tier 2: Code hooks (code-level)
 Python functions injected into the agent loop at specific hook points.
-The `after_round` hook is the most powerful: it can inject extra text into
-the agent's observation, enabling completion verification and loop detection.
+The `after_round` hook is the most powerful: it can control whether to run
+another LLM turn and what prompt to use next.
 
 {override_fields_doc}
 
@@ -296,8 +299,8 @@ the agent's observation, enabling completion verification and loop detection.
 
 ## Rules
 
-1. **Maximum 3 changes per patch.** Each strategy_edit counts as 1 change,
-   each code_hook counts as 1 change. Pick the highest-impact changes only.
+1. Include all high-quality fixes that are strongly supported by diagnosis evidence.
+   Do not drop good fixes only because there are multiple valid edits.
 2. Only generate hooks for hook points listed in the diagnosis `candidate_modules`.
    `strategy_library` is always allowed — you can ALWAYS add strategy_edits.
 3. When `strategy_suggestions` are provided by the diagnoser, you MUST add
@@ -307,12 +310,15 @@ the agent's observation, enabling completion verification and loop detection.
 6. For `code_hooks`: write a complete function named `hook` with the correct
    signature. Only use allowed imports. Write defensive code with fallbacks.
    Always initialize `context.kv` keys with setdefault before using them.
-7. For `after_round` hooks: the hook returns a dict. To inject text into the
-   next observation, return {{"inject": "your text"}}. Return {{}} otherwise.
-   Use `context.kv` to track state across rounds (e.g. confirm counts).
+7. For `after_round` hooks: return a dict with optional keys:
+   `request_new_turn`, `next_prompt`, `prompt_mode` ("append"/"replace"),
+   and optional `inject` (legacy append helper). Return {{}} for no-op.
+   Use `context.kv` to track state across rounds (e.g. counters/history).
 8. Match the strategy to the diagnosis. Do NOT blindly apply strategies.
 9. For `strategy_edits`: prefer `add` for new patterns, `edit` to refine
    existing strategies (reference by index), `remove` to delete obsolete ones.
+10. Never emit `${VAR}`-style placeholders in strategy text; they can break
+   runtime config interpolation. Use concrete values or plain placeholder words.
 
 ## Output format
 
@@ -337,14 +343,45 @@ Return a JSON object:
   Each `edit` needs an `index` (0-based) and new `strategy`.
   Each `remove` needs an `index`.
 - `code_hooks`: Python hook functions keyed by hook point name. Valid keys:
-  before_llm_call, before_execute, after_execute, on_timeout, on_parse_error,
-  after_round.
-- Total changes (strategy_edits count + hooks count) must be ≤ 3.
+  before_llm_call, before_execute, after_execute, on_timeout, after_round.
 """
 
 _MODULE_OVERRIDE_FILE: dict[str, str] = {
     "strategy_library": "strategy_library.yaml",
 }
+
+_HOOK_CATEGORIES: dict[str, tuple[str, ...]] = {
+    # Pre-action controls: prompt shaping and command/time control.
+    "pre_action_controls": ("before_llm_call", "before_execute", "on_timeout"),
+    # Post-action controls: output shaping and round-level continuation control.
+    "post_action_controls": ("after_execute", "after_round"),
+}
+_ALL_HOOK_POINTS: tuple[str, ...] = tuple(
+    hp for group in _HOOK_CATEGORIES.values() for hp in group
+)
+_MAX_DIAGNOSES_FOR_STRATEGY_PROMPT = 10
+_MAX_DIAGNOSES_FOR_HOOK_PROMPT = 6
+_MAX_TRACES_FOR_PROMPT = 8
+_STRATEGY_SUBAGENT_MAX_TOKENS = 3072
+_HOOK_SUBAGENT_MAX_TOKENS = 2048
+_JSON_RETRY_HINT_STRATEGY = (
+    "Your previous response could not be parsed as strict JSON.\n"
+    "Retry now and return ONLY one compact JSON object with keys:\n"
+    "  strategy_edits, rationale\n"
+    "Requirements:\n"
+    "- No markdown fences, no explanations, no <think> tags.\n"
+    "- Keep strategy_edits concise and high-impact.\n"
+    "- If many possible edits exist, prioritize the most impactful ones first."
+)
+_JSON_RETRY_HINT_HOOK = (
+    "Your previous response could not be parsed as strict JSON.\n"
+    "Retry now and return ONLY one compact JSON object with keys:\n"
+    "  code_hooks, rationale\n"
+    "Requirements:\n"
+    "- No markdown fences, no explanations, no <think> tags.\n"
+    "- Keep hook code minimal and robust.\n"
+    "- If uncertain, return empty code_hooks ({})."
+)
 
 
 def _serialise_traces_compact(traces: list[TraceRecord], max_traces: int = 15) -> str:
@@ -382,6 +419,13 @@ class LLMPatchPlanner:
         self._registry = registry
         self._override_base = override_base
         self._agent_name = agent_name
+        self._last_subagent_details: list[dict[str, Any]] = []
+        self.meta_step: int = 0
+
+    @property
+    def last_subagent_details(self) -> list[dict[str, Any]]:
+        """Planner sub-agent diagnostics from the most recent planning call."""
+        return list(self._last_subagent_details)
 
     async def plan_from_batch(
         self,
@@ -443,8 +487,21 @@ class LLMPatchPlanner:
             {"role": "user", "content": user_msg},
         ]
 
-    def _get_active_context(self) -> str:
-        """Summarize currently active strategy library and hooks for the planning prompt."""
+    def _get_active_context(
+        self,
+        *,
+        max_strategies: int = 12,
+        max_steps_per_strategy: int = 1,
+        max_step_chars: int = 180,
+        max_hooks: int = 6,
+        include_hook_source: bool = False,
+        hook_source_chars: int = 320,
+    ) -> str:
+        """Summarize currently active strategy library and hooks for planning.
+
+        Keeps the prompt compact by default, because full active context can
+        easily exceed model context limits and starve hook-generation calls.
+        """
         parts: list[str] = []
 
         override_dir = Path(self._override_base)
@@ -456,14 +513,18 @@ class LLMPatchPlanner:
                 strategies = content.get("strategies", [])
                 if strategies:
                     lines = ["**strategy_library.yaml** (current strategies):"]
-                    for idx, s in enumerate(strategies):
-                        pattern = s.get("pattern", "?")
+                    for idx, s in enumerate(strategies[:max_strategies]):
+                        pattern = str(s.get("pattern", "?"))[:140]
                         steps = s.get("steps", [])
                         lines.append(f"  [{idx}] pattern: {pattern}")
-                        for step in steps[:3]:
-                            lines.append(f"      - {step}")
-                        if len(steps) > 3:
+                        for step in steps[:max_steps_per_strategy]:
+                            lines.append(f"      - {str(step)[:max_step_chars]}")
+                        if len(steps) > max_steps_per_strategy:
                             lines.append(f"      ... ({len(steps)} steps total)")
+                    if len(strategies) > max_strategies:
+                        lines.append(
+                            f"  ... ({len(strategies) - max_strategies} more strategies omitted)"
+                        )
                     parts.append("\n".join(lines))
                 else:
                     parts.append("**strategy_library.yaml**: (empty — no strategies yet)")
@@ -472,14 +533,100 @@ class LLMPatchPlanner:
 
         hooks_dir = override_dir / "hooks"
         if hooks_dir.is_dir():
-            for hook_file in sorted(hooks_dir.glob("*.py")):
+            hook_files = sorted(hooks_dir.glob("*.py"))
+            for hook_file in hook_files[:max_hooks]:
                 try:
                     source = hook_file.read_text(encoding="utf-8")
-                    parts.append(f"**Active hook {hook_file.stem}**:\n```python\n{source}\n```")
+                    if include_hook_source:
+                        preview = source[:hook_source_chars]
+                        parts.append(
+                            f"**Active hook {hook_file.stem}**:\n```python\n{preview}\n```"
+                        )
+                    else:
+                        first_line = source.strip().split("\n")[0][:140]
+                        parts.append(f"**Active hook {hook_file.stem}**: {first_line}")
                 except Exception:
                     pass
+            if len(hook_files) > max_hooks:
+                parts.append(f"... ({len(hook_files) - max_hooks} more hooks omitted)")
 
         return "\n".join(parts) if parts else ""
+
+    @staticmethod
+    def _rank_diagnoses(
+        diagnoses: list[DiagnosisResult],
+    ) -> list[DiagnosisResult]:
+        """Sort diagnoses by confidence descending."""
+        return sorted(diagnoses, key=lambda d: d.confidence, reverse=True)
+
+    @staticmethod
+    def _select_hook_relevant_diagnoses(
+        diagnoses: list[DiagnosisResult],
+        hook_names: list[str],
+        *,
+        max_items: int,
+    ) -> list[DiagnosisResult]:
+        """Pick diagnoses relevant to requested hook points.
+
+        Supports both generic module mentions (e.g. ``hook:before_execute``)
+        and concrete historical hook-instance mentions
+        (e.g. ``hook:before_execute_candidate_1_xxx``).
+        """
+        requested_hook_points = set(hook_names)
+        filtered: list[DiagnosisResult] = []
+        for diagnosis in diagnoses:
+            for module_name in diagnosis.candidate_modules:
+                if not isinstance(module_name, str) or not module_name.startswith("hook:"):
+                    continue
+                hook_token = module_name[len("hook:"):].strip()
+                hook_point = LLMPatchPlanner._hook_point_from_hook_name(hook_token)
+                if hook_point is not None and hook_point in requested_hook_points:
+                    filtered.append(diagnosis)
+                    break
+        if not filtered:
+            filtered = diagnoses
+        return filtered[:max_items]
+
+    @staticmethod
+    def _hook_point_from_hook_name(name: str) -> str | None:
+        """Infer hook point from a hook filename stem/id."""
+        stem = str(name).strip()
+        if stem.endswith(".py"):
+            stem = stem[:-3]
+        for hook_point in _ALL_HOOK_POINTS:
+            if stem == hook_point or stem.startswith(f"{hook_point}_"):
+                return hook_point
+        return None
+
+    def _build_user_content(
+        self,
+        diagnoses: list[DiagnosisResult],
+        traces: list[TraceRecord],
+        *,
+        include_strategy_suggestions: bool,
+        active_context: str = "",
+        diagnosis_heading: str = "## Diagnoses",
+        max_traces: int = _MAX_TRACES_FOR_PROMPT,
+    ) -> str:
+        """Build compact planning user content."""
+        diag_text = self._format_diagnoses_limited(
+            diagnoses,
+            include_strategy_suggestions=include_strategy_suggestions,
+        )
+        failed_first = [t for t in traces if not t.success][:max_traces]
+        trace_text = _serialise_traces_compact(
+            failed_first, max_traces=max_traces,
+        ) or _serialise_traces_compact(
+            traces[:max_traces], max_traces=max_traces,
+        )
+
+        user_content = (
+            f"{diagnosis_heading}\n{diag_text}\n\n"
+            f"## Sample traces (failures prioritised)\n{trace_text}"
+        )
+        if active_context:
+            user_content += f"\n\n## Currently active modifications\n{active_context}"
+        return user_content
 
     async def _repair_hooks(
         self,
@@ -496,10 +643,13 @@ class LLMPatchPlanner:
             "before_execute": "def hook(commands, context):\n    # commands: list of objects with .keystrokes (str) and .duration_sec (float)\n    # Must return list (modify in-place or filter, do NOT construct new objects)",
             "after_execute": "def hook(terminal_output, context):\n    # terminal_output: str, context: HookContext\n    # Must return str",
             "on_timeout": "def hook(command_keystrokes, terminal_output, context):\n    # Must return str",
-            "on_parse_error": "def hook(raw_response, error, context):\n    # Must return str or None",
             "after_round": (
                 "def hook(terminal_output, is_task_complete, context):\n"
-                "    # Return dict: {\"inject\": \"text\"} to add text to observation, or {} for no-op.\n"
+                "    # Return dict with optional keys:\n"
+                "    #   request_new_turn: bool\n"
+                "    #   next_prompt: str\n"
+                "    #   prompt_mode: 'append' | 'replace'\n"
+                "    #   inject: str (legacy append helper)\n"
                 "    # Use context.kv.setdefault(\"key\", default) for persistent state."
             ),
         }
@@ -555,7 +705,8 @@ class LLMPatchPlanner:
                             "- Only allowed imports: re, json, math, collections, "
                             "itertools, functools, copy, textwrap, string.\n"
                             "- For before_execute: do NOT construct new command objects.\n"
-                            "- For after_round: return a dict (e.g. {'inject': 'text'} or {}).\n"
+                            "- For after_round: return a dict with optional keys "
+                            "{request_new_turn, next_prompt, prompt_mode, inject}.\n"
                             "- Return ONLY the fixed Python code, no markdown fences."
                         )},
                         {"role": "user", "content": (
@@ -582,50 +733,391 @@ class LLMPatchPlanner:
         traces: list[TraceRecord],
         n_samples: int,
     ) -> list[PatchCandidate]:
-        """Call the LLM N times with the SAME prompt, producing N diverse candidates."""
+        """Launch 3 sub-agents per candidate (strategy + two hook groups)."""
         self._client.set_role("planning")
-        messages = self._build_planning_messages(diagnoses, traces)
+        self._last_subagent_details: list[dict[str, Any]] = []
 
-        async def _single_call(idx: int) -> PatchCandidate | None:
-            data = None
-            # First attempt with default max_tokens
+        ranked_diagnoses = self._rank_diagnoses(diagnoses)
+        strategy_diagnoses = ranked_diagnoses[:_MAX_DIAGNOSES_FOR_STRATEGY_PROMPT]
+        strategy_active_context = self._get_active_context(
+            max_strategies=12,
+            max_steps_per_strategy=1,
+            max_hooks=4,
+            include_hook_source=False,
+        )
+        strategy_user_content = self._build_user_content(
+            strategy_diagnoses,
+            traces,
+            include_strategy_suggestions=True,
+            active_context=strategy_active_context,
+            diagnosis_heading="## Diagnoses",
+            max_traces=_MAX_TRACES_FOR_PROMPT,
+        )
+        strategy_msgs = self._build_strategy_only_messages(strategy_user_content)
+
+        hook_payloads: dict[str, tuple[list[str], list[dict[str, str]], set[str]]] = {}
+        for category, category_hooks in _HOOK_CATEGORIES.items():
+            allowed_hooks = list(category_hooks)
+            allowed_hook_point_set = set(allowed_hooks)
+            hook_diagnoses = self._select_hook_relevant_diagnoses(
+                ranked_diagnoses,
+                allowed_hooks,
+                max_items=_MAX_DIAGNOSES_FOR_HOOK_PROMPT,
+            )
+            hook_active_context = self._get_active_context(
+                max_strategies=8,
+                max_steps_per_strategy=1,
+                max_hooks=4,
+                include_hook_source=False,
+            )
+            hook_user_content = self._build_user_content(
+                hook_diagnoses,
+                traces,
+                include_strategy_suggestions=False,
+                active_context=hook_active_context,
+                diagnosis_heading=f"## Diagnoses ({category})",
+                max_traces=_MAX_TRACES_FOR_PROMPT,
+            )
+            hook_msgs = self._build_hook_category_messages(
+                category, allowed_hooks, hook_user_content,
+            )
+            hook_payloads[category] = (
+                allowed_hooks,
+                hook_msgs,
+            )
+
+        async def _run_strategy_subagent(candidate_idx: int) -> tuple[PatchCandidate | None, dict[str, Any]]:
+            label = f"candidate_{candidate_idx}/strategy"
+            detail: dict[str, Any] = {"label": label, "candidate_index": candidate_idx}
             try:
-                data = await self._client.chat_json(messages, temperature=0.7)
-            except Exception as exc:
-                logger.warning(
-                    f"LLM planning sample {idx} first attempt failed: {exc}; "
-                    "retrying with higher max_tokens"
+                data = await self._chat_json_with_compact_retry(
+                    strategy_msgs,
+                    label=label,
+                    retry_hint=_JSON_RETRY_HINT_STRATEGY,
+                    temperature=0.7,
+                    max_tokens=_STRATEGY_SUBAGENT_MAX_TOKENS,
                 )
+            except Exception as exc:
+                logger.warning(f"Strategy sub-agent {label} failed: {exc}")
+                detail["status"] = "error"
+                detail["error"] = str(exc)
+                return None, detail
 
-            # Retry with doubled max_tokens in case of truncation
-            if data is None:
-                try:
-                    higher_tokens = (self._client._cfg.max_tokens or 4096) * 2
-                    data = await self._client.chat_json(
-                        messages, temperature=0.7, max_tokens=higher_tokens,
-                    )
-                except Exception as exc:
-                    logger.warning(f"LLM planning sample {idx} retry also failed: {exc}")
-                    return None
+            data["code_hooks"] = {}
+            candidate = self._parse_response_to_candidate(
+                data, tag=f"candidate_{candidate_idx}_strategy",
+            )
+            if candidate is None:
+                detail["status"] = "empty"
+            else:
+                detail["status"] = "ok"
+                detail["modules"] = candidate.target_modules
+                detail["n_files"] = len(candidate.files)
+            return candidate, detail
 
-            # Attempt hook repair if any hooks fail validation
-            code_hooks = data.get("code_hooks", {})
-            if code_hooks:
-                repaired = await self._repair_hooks(code_hooks)
+        async def _run_hook_subagent(
+            candidate_idx: int,
+            category: str,
+            allowed_hooks: list[str],
+            hook_msgs: list[dict[str, str]],
+        ) -> tuple[PatchCandidate | None, dict[str, Any]]:
+            label = f"candidate_{candidate_idx}/hookgrp_{category}"
+            detail: dict[str, Any] = {
+                "label": label,
+                "candidate_index": candidate_idx,
+                "category": category,
+            }
+            try:
+                data = await self._chat_json_with_compact_retry(
+                    hook_msgs,
+                    label=label,
+                    retry_hint=_JSON_RETRY_HINT_HOOK,
+                    temperature=0.7,
+                    max_tokens=_HOOK_SUBAGENT_MAX_TOKENS,
+                )
+            except Exception as exc:
+                logger.warning(f"Hook sub-agent {label} failed: {exc}")
+                detail["status"] = "error"
+                detail["error"] = str(exc)
+                return None, detail
+
+            raw_hooks = data.get("code_hooks", {})
+            if not isinstance(raw_hooks, dict):
+                raw_hooks = {}
+            allowed = set(allowed_hooks)
+            raw_hooks = {k: v for k, v in raw_hooks.items() if k in allowed}
+            if raw_hooks:
+                repaired = await self._repair_hooks(raw_hooks)
                 data["code_hooks"] = repaired
+            else:
+                data["code_hooks"] = {}
+            data["strategy_edits"] = []
 
-            return self._parse_response_to_candidate(data, tag=f"sample_{idx}")
+            candidate = self._parse_response_to_candidate(
+                data,
+                tag=f"candidate_{candidate_idx}_hookgrp_{category}",
+            )
+            if candidate is None:
+                detail["status"] = "empty"
+            else:
+                detail["status"] = "ok"
+                detail["modules"] = candidate.target_modules
+                detail["n_files"] = len(candidate.files)
+            return candidate, detail
 
-        results = await asyncio.gather(*[_single_call(i) for i in range(n_samples)])
-        candidates = [c for c in results if c is not None]
+        async def _run_candidate_group(candidate_idx: int) -> tuple[PatchCandidate | None, list[dict[str, Any]]]:
+            strategy_task = asyncio.ensure_future(_run_strategy_subagent(candidate_idx))
+            hook_tasks = [
+                asyncio.ensure_future(
+                    _run_hook_subagent(
+                        candidate_idx,
+                        category,
+                        allowed_hooks,
+                        hook_msgs,
+                    ),
+                )
+                for category, (allowed_hooks, hook_msgs) in hook_payloads.items()
+            ]
+            sub_results = await asyncio.gather(strategy_task, *hook_tasks)
+
+            partials: list[PatchCandidate] = []
+            details: list[dict[str, Any]] = []
+            for candidate, detail in sub_results:
+                details.append(detail)
+                if candidate is not None:
+                    partials.append(candidate)
+
+            merged = self._merge_candidate_partials(
+                partials, candidate_idx=candidate_idx,
+            )
+            summary = {
+                "label": f"candidate_{candidate_idx}",
+                "candidate_index": candidate_idx,
+                "status": "ok" if merged is not None else "empty",
+                "n_partials": len(partials),
+            }
+            if merged is not None:
+                summary["modules"] = merged.target_modules
+                summary["n_files"] = len(merged.files)
+            details.append(summary)
+            return merged, details
+
+        candidate_tasks: list[asyncio.Task] = [
+            asyncio.ensure_future(_run_candidate_group(i))
+            for i in range(n_samples)
+        ]
+        results = await asyncio.gather(*candidate_tasks, return_exceptions=True) if candidate_tasks else []
+
+        candidates: list[PatchCandidate] = []
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.warning(f"Planner candidate group {idx} raised: {result}")
+                self._last_subagent_details.append({
+                    "label": f"candidate_{idx}",
+                    "candidate_index": idx,
+                    "status": "error",
+                    "error": str(result),
+                })
+                continue
+            merged_candidate, details = result
+            self._last_subagent_details.extend(details)
+            if merged_candidate is not None:
+                candidates.append(merged_candidate)
 
         logger.info(
-            f"LLM planner produced {len(candidates)}/{n_samples} valid candidates"
+            f"LLM planner produced {len(candidates)} candidates from "
+            f"{len(candidate_tasks)} candidate groups "
+            f"({len(candidate_tasks) * (1 + len(_HOOK_CATEGORIES))} sub-agent calls)"
         )
         return candidates
 
+    @staticmethod
+    def _merge_candidate_partials(
+        partials: list[PatchCandidate],
+        *,
+        candidate_idx: int,
+    ) -> PatchCandidate | None:
+        """Merge strategy/hook partial patches into one candidate."""
+        if not partials:
+            return None
+
+        modules: list[str] = []
+        files: list[PatchFileEdit] = []
+        required_tests: list[str] = []
+        rollback_if: list[str] = []
+        notes: list[str] = []
+        risk = "low"
+
+        for part in partials:
+            for m in part.target_modules:
+                if m not in modules:
+                    modules.append(m)
+            files.extend(part.files)
+            for t in part.required_tests:
+                if t not in required_tests:
+                    required_tests.append(t)
+            for r in part.rollback_if:
+                if r not in rollback_if:
+                    rollback_if.append(r)
+            if part.notes:
+                notes.append(part.notes)
+            if part.risk == "high":
+                risk = "high"
+            elif part.risk == "medium" and risk == "low":
+                risk = "medium"
+
+        if not files:
+            return None
+
+        return PatchCandidate(
+            target_modules=modules,
+            files=files,
+            risk=risk,
+            required_tests=required_tests or ["canary_eval"],
+            rollback_if=rollback_if or ["canary_regression"],
+            notes=" | ".join(notes)[:500] or f"[LLM candidate_{candidate_idx}] merged partial edits",
+        )
+
+    async def _chat_json_with_compact_retry(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        label: str,
+        retry_hint: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> dict[str, Any]:
+        """Call chat_json with one compact-output retry on parse failure."""
+        try:
+            return await self._client.chat_json(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as first_error:
+            logger.warning(
+                f"{label}: first JSON call failed ({first_error}); retrying with compact hint"
+            )
+            retry_messages = list(messages) + [
+                {"role": "user", "content": retry_hint},
+            ]
+            return await self._client.chat_json(
+                retry_messages,
+                temperature=min(temperature, 0.3),
+                max_tokens=min(max_tokens, 2048),
+            )
+
+    def _build_strategy_only_messages(self, user_content: str) -> list[dict[str, str]]:
+        """System prompt focused solely on strategy library edits."""
+        system = (
+            "You are an expert AI-agent architect. Based on the diagnosis and traces, "
+            "generate ONLY strategy_edits (add/edit/remove) for the agent's strategy library.\n"
+            "Do NOT generate code_hooks.\n\n"
+            "Do NOT use unresolved config placeholders like ${VAR} in strategy text.\n"
+            "Use concrete shell snippets or explicit placeholder words without ${...} syntax.\n\n"
+            "Output must be STRICT JSON only (no markdown fences / no <think> blocks).\n"
+            "Keep output compact and high-impact to avoid truncation.\n\n"
+            f"{_IMPROVEMENT_STRATEGIES}\n\n"
+            "## Output format\n\n"
+            '```json\n{{\n  "strategy_edits": [\n'
+            '    {{"action": "add", "strategy": {{"pattern": "...", "steps": ["..."]}}}}\n'
+            "  ],\n"
+            '  "rationale": "<brief explanation>"\n}}\n```\n'
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _build_hook_only_messages(self, hook_name: str, user_content: str) -> list[dict[str, str]]:
+        """System prompt focused on generating a single hook."""
+        system = (
+            f"You are an expert AI-agent architect. Generate ONLY a code hook for "
+            f"the **{hook_name}** hook point. Do NOT generate strategy_edits.\n\n"
+            f"{_OVERRIDE_FIELDS_DOC}\n\n"
+            f"{_TERMINUS2_CODE_CONTEXT}\n\n"
+            "## Output format\n\n"
+            "```json\n{{\n"
+            f'  "code_hooks": {{"{hook_name}": "<Python source>"}},\n'
+            '  "rationale": "<brief explanation>"\n}}\n```\n'
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
+
+    def _build_hook_category_messages(
+        self,
+        category: str,
+        hook_names: list[str],
+        user_content: str,
+    ) -> list[dict[str, str]]:
+        """System prompt focused on a hook category (multiple hook points)."""
+        hooks_literal = ", ".join(hook_names)
+        system = (
+            "You are an expert AI-agent architect. Generate ONLY code hooks.\n"
+            f"Hook category: {category}\n"
+            f"Allowed hook points in this category: {hooks_literal}\n"
+            "You may generate one or more hooks from this allowed set.\n"
+            "Do NOT generate strategy_edits.\n\n"
+            "Output must be STRICT JSON only (no markdown fences / no <think> blocks).\n"
+            "Keep output compact and robust.\n\n"
+            f"{_OVERRIDE_FIELDS_DOC}\n\n"
+            f"{_TERMINUS2_CODE_CONTEXT}\n\n"
+            "## Output format\n\n"
+            "```json\n{{\n"
+            '  "code_hooks": {\n'
+            f'    "{hook_names[0]}": "<Python source>"\n'
+            "  },\n"
+            '  "rationale": "<brief explanation>"\n}}\n```\n'
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ]
+
+    @staticmethod
+    def _merge_strategy_and_hook_candidates(
+        candidates: list[PatchCandidate], n_target: int,
+    ) -> list[PatchCandidate]:
+        """Combine pure-strategy and pure-hook candidates into mixed ones.
+
+        If we have more candidates than ``n_target``, pair up strategy and hook
+        candidates so each resulting candidate has both edits (richer for GRPO).
+        Leftover candidates are kept as-is.
+        """
+        strategy_only = [c for c in candidates if all(m == "strategy_library" for m in c.target_modules)]
+        hook_only = [c for c in candidates if all(m.startswith("hook:") for m in c.target_modules)]
+        mixed = [c for c in candidates if c not in strategy_only and c not in hook_only]
+
+        merged: list[PatchCandidate] = list(mixed)
+
+        si, hi = 0, 0
+        while si < len(strategy_only) and hi < len(hook_only):
+            sc = strategy_only[si]
+            hc = hook_only[hi]
+            merged.append(PatchCandidate(
+                target_modules=sc.target_modules + hc.target_modules,
+                files=sc.files + hc.files,
+                risk=hc.risk,
+                required_tests=["canary_eval"],
+                rollback_if=["canary_regression"],
+                notes=f"[merged] {sc.notes} + {hc.notes}",
+            ))
+            si += 1
+            hi += 1
+
+        for c in strategy_only[si:]:
+            merged.append(c)
+        for c in hook_only[hi:]:
+            merged.append(c)
+
+        return merged[:max(n_target, len(merged))]
+
     def _parse_response_to_candidate(
-        self, data: dict[str, Any], tag: str = ""
+        self,
+        data: dict[str, Any],
+        tag: str = "",
     ) -> PatchCandidate | None:
         """Parse one LLM JSON response into a single PatchCandidate.
 
@@ -635,7 +1127,6 @@ class LLMPatchPlanner:
         code_hooks: dict[str, str] = data.get("code_hooks", {})
         rationale: str = data.get("rationale", "")
 
-        # Backward compat: if old "overrides" contains strategy_library, convert
         overrides_map = data.get("overrides", {})
         if isinstance(overrides_map, dict) and "strategy_library" in overrides_map and not strategy_edits:
             sl = overrides_map.pop("strategy_library")
@@ -650,11 +1141,9 @@ class LLMPatchPlanner:
         target_modules: list[str] = []
         file_edits: list[PatchFileEdit] = []
         risk = "low"
-        change_count = 0
-        max_changes = 3
 
         # Strategy library edits: add/edit/remove operations
-        if strategy_edits and change_count < max_changes:
+        if strategy_edits:
             valid_edits = []
             for edit in strategy_edits:
                 if not isinstance(edit, dict):
@@ -679,13 +1168,10 @@ class LLMPatchPlanner:
                     path=override_path, change_type="modify", intent=intent,
                 ))
                 target_modules.append("strategy_library")
-                change_count += 1
 
         # Code hooks: model-generated Python functions
         if code_hooks:
             for hook_name, hook_source in code_hooks.items():
-                if change_count >= max_changes:
-                    break
                 if not isinstance(hook_source, str) or not hook_source.strip():
                     continue
                 try:
@@ -710,12 +1196,24 @@ class LLMPatchPlanner:
                     logger.warning(f"Hook {hook_name} rejected: {e}")
                     continue
 
-                hook_path = f"{self._override_base}/hooks/{hook_name}.py"
+                tag_variant = "".join(ch if ch.isalnum() else "_" for ch in tag).strip("_")
+                prefix = f"hook_{hook_name}_"
+                if tag_variant.startswith(prefix):
+                    tag_variant = tag_variant[len(prefix):]
+                elif tag_variant == f"hook_{hook_name}":
+                    tag_variant = ""
+                unique_suffix = uuid4().hex[:8]
+                step_tag = f"s{self.meta_step}" if self.meta_step > 0 else "s0"
+                if tag_variant:
+                    hook_filename = f"{hook_name}_{step_tag}_{tag_variant}_{unique_suffix}.py"
+                else:
+                    hook_filename = f"{hook_name}_{step_tag}_{unique_suffix}.py"
+
+                hook_path = f"{self._override_base}/hooks/{hook_filename}"
                 file_edits.append(PatchFileEdit(
                     path=hook_path, change_type="create", intent=hook_source,
                 ))
                 target_modules.append(f"hook:{hook_name}")
-                change_count += 1
                 risk = "high"
 
         if not file_edits:
@@ -732,35 +1230,60 @@ class LLMPatchPlanner:
 
     @staticmethod
     def _format_diagnoses(diagnoses: list[DiagnosisResult]) -> str:
+        return LLMPatchPlanner._format_diagnoses_limited(
+            diagnoses,
+            include_strategy_suggestions=True,
+        )
+
+    @staticmethod
+    def _format_diagnoses_limited(
+        diagnoses: list[DiagnosisResult],
+        *,
+        include_strategy_suggestions: bool,
+        max_hypotheses_per_diagnosis: int = 3,
+        max_tasks_per_diagnosis: int = 5,
+        max_strategy_suggestions: int = 12,
+        max_steps_per_suggestion: int = 5,
+    ) -> str:
         parts: list[str] = []
         all_suggestions: list[dict] = []
         for d in diagnoses:
+            hypotheses = [str(h)[:260] for h in d.root_cause_hypotheses[:max_hypotheses_per_diagnosis]]
             block = (
                 f"- **{d.problem_type}** (conf={d.confidence:.2f})\n"
-                f"  Hypotheses: {'; '.join(d.root_cause_hypotheses)}\n"
+                f"  Hypotheses: {'; '.join(hypotheses)}\n"
                 f"  Candidate modules: {d.candidate_modules}\n"
-                f"  Affected tasks: {d.affected_task_ids[:5]}"
+                f"  Affected tasks: {d.affected_task_ids[:max_tasks_per_diagnosis]}"
             )
-            summary = d.metadata.get("analysis_summary", "")
+            summary = str(d.metadata.get("analysis_summary", ""))[:700]
             if summary:
                 block += f"\n  Evidence: {summary}"
-            if d.strategy_suggestions:
+            if include_strategy_suggestions and d.strategy_suggestions:
                 block += f"\n  Strategy suggestions: {len(d.strategy_suggestions)} extracted"
                 all_suggestions.extend(d.strategy_suggestions)
             parts.append(block)
 
         result = "\n".join(parts)
-        if all_suggestions:
+        if include_strategy_suggestions and all_suggestions:
             result += "\n\n## Extracted strategy suggestions from successful traces\n"
             result += (
                 "The diagnoser extracted these strategies from comparing successful "
                 "vs failed traces. You MUST add them to the strategy library via "
                 "`strategy_edits` with action `add`.\n\n"
             )
-            for i, s in enumerate(all_suggestions):
+            shown = all_suggestions[:max_strategy_suggestions]
+            for i, s in enumerate(shown):
+                steps = s.get("steps", [])
+                if isinstance(steps, list):
+                    steps = steps[:max_steps_per_suggestion]
                 result += (
                     f"{i+1}. **Pattern**: {s.get('pattern', '?')}\n"
-                    f"   **Steps**: {s.get('steps', [])}\n"
+                    f"   **Steps**: {steps}\n"
                     f"   **Source**: {s.get('source', 'unknown')}\n"
+                )
+            if len(all_suggestions) > max_strategy_suggestions:
+                result += (
+                    f"... ({len(all_suggestions) - max_strategy_suggestions} more "
+                    "strategy suggestions omitted)\n"
                 )
         return result

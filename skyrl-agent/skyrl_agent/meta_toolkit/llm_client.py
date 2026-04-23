@@ -125,12 +125,46 @@ class MetaLLMClient:
         """Chat and parse the response as JSON (single LLM call).
 
         Always uses json_mode=False to avoid double-call with thinking models.
-        Strips <think> blocks before extracting JSON.
+        Strips <think> blocks before extracting JSON. If extraction fails,
+        performs one additional "JSON reformat" call as a best-effort repair.
         """
         raw = await self.chat(
             messages, temperature=temperature, max_tokens=max_tokens, json_mode=False
         )
-        return _extract_json(raw)
+        try:
+            return _extract_json(raw)
+        except ValueError as first_error:
+            repair_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You convert model output into strict JSON.\n"
+                        "Return ONLY one valid JSON object.\n"
+                        "Do not include markdown fences, explanations, or <think> tags."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Convert the following text into a single valid JSON object, "
+                        "preserving keys/values whenever possible:\n\n"
+                        f"{raw}"
+                    ),
+                },
+            ]
+            repaired_raw = await self.chat(
+                repair_messages,
+                temperature=0.0,
+                max_tokens=max_tokens,
+                json_mode=False,
+            )
+            try:
+                return _extract_json(repaired_raw)
+            except ValueError as repair_error:
+                raise ValueError(
+                    "Could not extract JSON from LLM response after repair attempt. "
+                    f"first_error={first_error}; repair_error={repair_error}"
+                ) from repair_error
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -152,59 +186,171 @@ def _extract_json(text: str) -> dict[str, Any]:
     """
     cleaned = _strip_think_tags(text)
 
+    seen_sources: set[str] = set()
     for source in (cleaned, text):
-        for pattern in [
-            r"```json\s*\n(.*?)\n\s*```",
-            r"```\s*\n(.*?)\n\s*```",
-        ]:
-            m = re.search(pattern, source, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(1))
-                except json.JSONDecodeError:
-                    repaired = _try_repair_json(m.group(1))
-                    if repaired is not None:
-                        return repaired
+        if not source or source in seen_sources:
+            continue
+        seen_sources.add(source)
 
-        # Match the outermost { ... } block
-        m = re.search(r"(\{.*\})", source, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                repaired = _try_repair_json(m.group(1))
-                if repaired is not None:
-                    return repaired
+        for fenced in _iter_fenced_blocks(source):
+            parsed = _parse_json_candidate(fenced)
+            if parsed is not None:
+                return parsed
+            for obj in _iter_balanced_json_objects(fenced):
+                parsed = _parse_json_candidate(obj)
+                if parsed is not None:
+                    return parsed
+
+        for obj in _iter_balanced_json_objects(source):
+            parsed = _parse_json_candidate(obj)
+            if parsed is not None:
+                return parsed
 
     # Last resort: find anything starting with { and try to close it
-    m = re.search(r"(\{.*)", cleaned or text, re.DOTALL)
-    if m:
-        repaired = _try_repair_json(m.group(1))
+    last_resort = cleaned or text
+    brace_idx = last_resort.find("{")
+    if brace_idx >= 0:
+        repaired = _try_repair_json(last_resort[brace_idx:])
         if repaired is not None:
             return repaired
 
     raise ValueError(f"Could not extract JSON from LLM response: {text[:300]}")
 
 
+def _iter_fenced_blocks(source: str) -> list[str]:
+    blocks: list[str] = []
+    for pattern in (
+        r"```json\s*\n(.*?)\n\s*```",
+        r"```\s*\n(.*?)\n\s*```",
+    ):
+        for match in re.finditer(pattern, source, re.DOTALL | re.IGNORECASE):
+            block = match.group(1).strip()
+            if block:
+                blocks.append(block)
+    return blocks
+
+
+def _iter_balanced_json_objects(source: str):
+    """Yield balanced {...} substrings while respecting quoted strings."""
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escape_next = False
+
+    for i, char in enumerate(source):
+        if in_string:
+            if escape_next:
+                escape_next = False
+                continue
+            if char == "\\":
+                escape_next = True
+                continue
+            if char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+            continue
+        if char == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield source[start : i + 1]
+                start = None
+
+
+def _parse_json_candidate(candidate: str) -> dict[str, Any] | None:
+    candidate = candidate.strip()
+    if not candidate:
+        return None
+    try:
+        parsed = json.loads(candidate)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return _try_repair_json(candidate)
+
+
 def _try_repair_json(text: str) -> dict[str, Any] | None:
     """Try to repair truncated JSON by closing open braces/brackets."""
-    text = text.rstrip()
+    text = text.strip()
+    if not text:
+        return None
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    # If there is trailing garbage after a complete object, trim to last '}'.
+    last_close = text.rfind("}")
+    if last_close != -1:
+        clipped = text[: last_close + 1].rstrip()
+        try:
+            parsed = json.loads(clipped)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            text = clipped
+
     # Remove trailing comma
     text = re.sub(r",\s*$", "", text)
+    # Truncated escape sequence at EOF breaks JSON parsing.
+    text = re.sub(r"\\+$", "", text)
 
     # Close any open strings
     if text.count('"') % 2 != 0:
         text += '"'
 
-    # Count open braces/brackets and close them
-    open_braces = text.count("{") - text.count("}")
-    open_brackets = text.count("[") - text.count("]")
+    # Count open braces/brackets while ignoring JSON strings.
+    open_braces, open_brackets = _count_unclosed_json_delimiters(text)
 
     suffix = "]" * max(0, open_brackets) + "}" * max(0, open_braces)
     if suffix:
         candidate = text + suffix
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             pass
     return None
+
+
+def _count_unclosed_json_delimiters(text: str) -> tuple[int, int]:
+    """Count unmatched '{' and '[' delimiters while respecting quoted strings."""
+    open_braces = 0
+    open_brackets = 0
+    in_string = False
+    escape_next = False
+
+    for ch in text:
+        if in_string:
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == "\\":
+                escape_next = True
+                continue
+            if ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            open_braces += 1
+        elif ch == "}":
+            open_braces = max(0, open_braces - 1)
+        elif ch == "[":
+            open_brackets += 1
+        elif ch == "]":
+            open_brackets = max(0, open_brackets - 1)
+
+    return open_braces, open_brackets

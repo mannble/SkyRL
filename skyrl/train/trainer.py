@@ -1241,7 +1241,8 @@ class RayPPOTrainer:
         self.all_metrics.update(meta_metrics)
         self.all_metrics["meta_rl/batch_size"] = n
         self.all_metrics["meta_rl/padded_to"] = target_n
-        logger.info(f"Meta-RL mini step done: {n} samples (padded to {target_n}), policy_loss={status.get('total_loss', 'N/A')}")
+        ploss = status.get("policy_loss", status.get("final_loss", status.get("loss", "N/A")))
+        logger.info(f"Meta-RL mini step done: {n} samples (padded to {target_n}), policy_loss={ploss}")
 
     def handle_dynamic_sampling(
         self, generator_output: GeneratorOutput, uids: List[str]

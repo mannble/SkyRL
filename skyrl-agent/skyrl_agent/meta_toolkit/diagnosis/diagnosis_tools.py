@@ -290,20 +290,30 @@ def build_task_grouped_message(
     history: DiagnosisHistory,
     *,
     focus: str = "all",
+    target_task: TaskGroup | None = None,
+    task_category: str = "",
 ) -> str:
     """Build the initial user message with task-grouped sampling.
 
     Args:
         focus: "all" (default), "all_fail", "partial", or "context_length".
                Workers can use different focus values.
+        target_task: When set, the worker analyses only this single task.
+        task_category: "partial", "all_fail", or "all_pass" -- describes the
+                       target task's category for focused instructions.
     """
     stats = get_failure_distribution(traces)
     history_text = history.format_for_prompt(5)
 
+    # --- Single-task mode ---
+    if target_task is not None:
+        return _build_single_task_message(
+            stats, history_text, target_task, task_category,
+        )
+
     groups = group_traces_by_task(traces)
     all_fail, partial, all_pass = classify_task_groups(groups)
 
-    # Build investigation targets based on focus
     sections: list[str] = []
 
     if focus in ("all", "partial"):
@@ -398,6 +408,70 @@ def build_task_grouped_message(
         "Use get_task_overview to see all trajectories for a task. "
         "When done, call submit_diagnosis with your findings."
     )
+
+
+def _build_single_task_message(
+    batch_stats: str,
+    history_text: str,
+    group: TaskGroup,
+    category: str,
+) -> str:
+    """Build a focused user message for a single-task diagnosis worker."""
+    lines: list[str] = [
+        f"## Batch context (for reference)\n{batch_stats}\n",
+        f"## Recent meta-learning history\n{history_text}\n",
+        f"## Your assignment: analyse task **{group.task_key}** ({category})\n",
+        f"Task statistics: {group.n_success}/{group.n_total} passed, "
+        f"avg_reward={group.avg_reward:.3f}",
+        "",
+        "Trajectories:",
+    ]
+    for t in group.traces:
+        tag_str = ",".join(t.failure_tags) if t.failure_tags else "-"
+        lines.append(
+            f"  {t.task_id}: reward={t.final_reward}, turns={t.turn_count}, "
+            f"finish={t.finish_reason}, tags=[{tag_str}], success={t.success}"
+        )
+
+    lines.append("")
+
+    if category == "partial":
+        fail_ids = group.fail_ids()[:3]
+        succ_ids = group.success_ids()[:3]
+        lines.append(
+            "This is a PARTIAL task — some trajectories succeed and some fail. "
+            "You MUST:\n"
+            f"  1. Use inspect_trace on at least one success ({succ_ids}) and one failure ({fail_ids}).\n"
+            f"  2. Use compare_traces to contrast a success vs a failure.\n"
+            "  3. Identify what the successful trajectory did differently.\n"
+            "  4. Your submit_diagnosis MUST include `strategy_suggestions` — "
+            "extract the winning approach as a reusable strategy with "
+            '`pattern`, `steps`, and `source` fields.\n'
+        )
+    elif category == "all_fail":
+        sample_ids = [t.task_id for t in group.traces[:3]]
+        lines.append(
+            "This task ALWAYS FAILS across all trajectories. Investigate:\n"
+            f"  1. Use inspect_trace on a few traces ({sample_ids}) to understand the failure.\n"
+            "  2. Identify the root cause: is it a planning issue, timeout, "
+            "context overflow, wrong approach, etc.?\n"
+            "  3. Submit a diagnosis with specific `root_cause_hypotheses` and "
+            "`candidate_modules` that could fix the problem.\n"
+            "  4. Do NOT submit strategy_suggestions for all-fail tasks "
+            "(no successful trajectory to learn from).\n"
+        )
+    elif category == "all_pass":
+        lines.append(
+            "This task ALWAYS PASSES. Examine it briefly for regression "
+            "context — what does a successful execution look like for this "
+            "type of task? Keep your investigation short.\n"
+        )
+
+    lines.append(
+        "Use inspect_trace, compare_traces, and get_task_overview as needed. "
+        "When done, call submit_diagnosis with your findings."
+    )
+    return "\n".join(lines)
 
 
 TOOL_DESCRIPTIONS = """\

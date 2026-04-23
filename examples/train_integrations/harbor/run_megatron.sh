@@ -8,9 +8,9 @@ set -ex
 
 # wandb api key.
 # export WANDB_API_KEY=YOUR_KEY_HERE
-export CUDA_VISIBLE_DEVICES=0,1,6,7
-export DAYTONA_API_KEY=${DAYTONA_API_KEY:-"YOUR_KEY_HERE"}
-export WANDB_API_KEY=${WANDB_API_KEY:-"YOUR_KEY_HERE"}
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export DAYTONA_API_KEY=dtn_42e241b88dd48c74e41b12639ddcfd0a90bf73d3de45ae8180eef09d5adacf95
+export WANDB_API_KEY=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
 # Pick the sandbox provider and provide the credentials.
 # export DAYTONA_API_KEY=YOUR_KEY_HERE
 # export MODAL_TOKEN_ID=YOUR_KEY_HERE
@@ -23,18 +23,18 @@ export WANDB_API_KEY=${WANDB_API_KEY:-"YOUR_KEY_HERE"}
 # uv run examples/train_integrations/harbor/prepare_harbor_dataset.py --dataset open-thoughts/CodeContests
 # uv run examples/train_integrations/harbor/prepare_harbor_dataset.py --dataset open-thoughts/OpenThoughts-TB-dev
 DATA_DIR="$HOME/data/harbor"
-TRAIN_DATA="['$DATA_DIR/OpenThoughts-Agent-v1-RL']"
+TRAIN_DATA="['$DATA_DIR/endless-terminal-docker']"
 EVAL_DATA="['$DATA_DIR/OpenThoughts-TB-dev']"
 
 #-----------------------
 # Directory setup
 #-----------------------
-MODEL_NAME="/home/test/test1714/wxh/Qwen3.5-4B"
-SERVED_MODEL_NAME="Qwen3.5-4B"
-RUN_NAME="OT-meta2-terminus2-qwen3_5_4b_megatron"
+MODEL_NAME="/home/test/test1714/wxh/Qwen3.5-9B"
+SERVED_MODEL_NAME="Qwen3.5-9B"
+RUN_NAME="ET-meta1-terminus2-qwen3_5_9b_megatron"
 TRIALS_DIR="/home/test/test1714/wxh/skyrl/$RUN_NAME/trials_run"
 CKPTS_DIR="/home/test/test1714/wxh/skyrl/$RUN_NAME/ckpts"
-EXPORTS_DIR="$HOME/$RUN_NAME/exports"
+EXPORTS_DIR="/home/test/test1714/wxh/skyrl/$RUN_NAME/exports"
 LOG_DIR="/tmp/skyrl-logs/$RUN_NAME"
 
 #-----------------------
@@ -61,13 +61,8 @@ CHAT_TEMPLATE_PATH="$(dirname "$0")/../../../skyrl/train/utils/templates/qwen3_a
 NUM_NODES=1
 NUM_GPUS=4
 
-# MEGATRON_TP=2
-# MEGATRON_PP=1
-# MEGATRON_CP=1
-# MEGATRON_EP=4
-# MEGATRON_ETP=1
-MEGATRON_TP=4      # 张量并行度（4卡全切分）
-MEGATRON_PP=1      # 流水线并行度
+MEGATRON_TP=4      # 张量并行度（受限于 num_query_groups=4）
+MEGATRON_PP=1      # 流水线并行度（PP>1 与 Megatron RoPE 动态序列长度不兼容）
 MEGATRON_CP=1      # 上下文并行度
 MEGATRON_EP=1      # 专家并行度（稠密模型必须设为1！）
 MEGATRON_ETP=1     # 专家张量并行度
@@ -98,7 +93,7 @@ uv run --isolated --extra megatron --extra harbor -m examples.train_integrations
   trainer.algorithm.loss_reduction=$LOSS_REDUCTION \
   trainer.algorithm.grpo_norm_by_std=$GRPO_NORM_BY_STD \
   trainer.algorithm.use_kl_loss=$USE_KL_LOSS \
-  trainer.placement.colocate_all=true \
+  trainer.placement.colocate_all=false \
   trainer.strategy=megatron \
   trainer.placement.policy_num_nodes=$NUM_NODES \
   trainer.placement.policy_num_gpus_per_node=$NUM_GPUS \

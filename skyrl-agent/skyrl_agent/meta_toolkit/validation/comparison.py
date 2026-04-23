@@ -20,6 +20,10 @@ class ComparisonConfig:
     # Require at least this many tasks in the canary set
     min_canary_tasks: int = 1
 
+    # Per-task regression guard: reject if any single task's avg reward drops
+    # by more than this amount vs baseline.  Set to 0.0 to disable.
+    max_per_task_drop: float = 0.3
+
 
 class ComparisonEngine:
     """Compare before/after scores and produce a PatchEvalResult."""
@@ -71,7 +75,31 @@ class ComparisonEngine:
 
         regression = self._is_regression(delta, len(after_scores))
 
-        if regression:
+        # Per-task regression guard
+        worst_task_drop = 0.0
+        worst_task_idx = -1
+        if self.config.max_per_task_drop > 0:
+            for idx, (b, a) in enumerate(zip(before_scores, after_scores)):
+                drop = b - a
+                if drop > worst_task_drop:
+                    worst_task_drop = drop
+                    worst_task_idx = idx
+
+        per_task_regressed = (
+            self.config.max_per_task_drop > 0
+            and worst_task_drop > self.config.max_per_task_drop
+        )
+        if per_task_regressed:
+            regression = True
+
+        if per_task_regressed:
+            tid = task_ids[worst_task_idx] if task_ids and worst_task_idx < len(task_ids) else f"#{worst_task_idx}"
+            notes = (
+                (notes + " " if notes else "")
+                + f"PER-TASK REGRESSION: task {tid} dropped {worst_task_drop:.4f} "
+                f"(threshold {self.config.max_per_task_drop})."
+            )
+        elif regression:
             notes = (notes + " " if notes else "") + "REGRESSION detected."
         elif delta > self.config.min_delta:
             notes = (notes + " " if notes else "") + f"Improvement: delta={delta:.4f}"

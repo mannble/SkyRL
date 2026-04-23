@@ -53,8 +53,16 @@ class MetaLoopConfig:
     max_candidates: int = 2  # Max patch candidates per cycle
     canary_num_tasks: int = 4  # Tasks for canary eval
     canary_n_samples: int = 3  # Trials per task per side (baseline/candidate)
+    canary_diagnosed_ratio: float = 0.75  # Fraction of canary failures from diagnosed tasks
+    canary_min_undiagnosed: int = 2  # Keep a few unseen tasks for generalization check
     override_base: str = "/home/ray/SkyRL/examples/train_integrations/harbor/meta_patches/terminus2"
     log_dir: str = "/tmp/skyrl-logs"
+
+    # Diagnosis worker sampling (per meta cycle)
+    diagnosis_num_workers: int = 16
+    diagnosis_partial_tasks: int = 8
+    diagnosis_all_fail_tasks: int = 8
+    diagnosis_all_pass_tasks: int = 0
 
     # Phase 3: LLM-based diagnosis & patch planning
     llm_model: str = ""  # e.g. "gpt-4o", "qwen3-32b" — empty = use rule-based
@@ -62,6 +70,10 @@ class MetaLoopConfig:
     llm_api_key: str = ""
     llm_temperature: float = 0.3
     llm_max_tokens: int = 4096
+
+    # Patch library limits (enforced by PatchPruner)
+    max_strategies: int = 32
+    max_hooks_per_category: int = 8
 
     @classmethod
     def from_cfg(cls, cfg) -> "MetaLoopConfig":
@@ -134,12 +146,15 @@ class _MetaLoopController:
 
         self._llm_client = None
         self._use_llm = bool(config.llm_model)
+        self._pruner = None
+        accepted_patches_dir = Path(config.log_dir) / "accepted_patches"
 
         if self._use_llm:
             from skyrl_agent.meta_toolkit.llm_client import MetaLLMClient, MetaLLMConfig
             from skyrl_agent.meta_toolkit.diagnosis.interactive_diagnoser import InteractiveDiagnoser
             from skyrl_agent.meta_toolkit.diagnosis.diagnosis_history import DiagnosisHistory
             from skyrl_agent.meta_toolkit.editing.llm_patch_planner import LLMPatchPlanner
+            from skyrl_agent.meta_toolkit.editing.patch_pruner import PatchPruner
 
             llm_cfg = MetaLLMConfig(
                 model=config.llm_model,
@@ -154,11 +169,21 @@ class _MetaLoopController:
             self._diagnoser = InteractiveDiagnoser(
                 self._llm_client,
                 history=self._diagnosis_history,
+                num_workers=config.diagnosis_num_workers,
+                max_partial_tasks=config.diagnosis_partial_tasks,
+                max_all_fail_tasks=config.diagnosis_all_fail_tasks,
+                max_all_pass_tasks=config.diagnosis_all_pass_tasks,
                 override_base=config.override_base,
             )
             self._llm_planner = LLMPatchPlanner(
                 self._llm_client, registry, config.override_base,
                 agent_name=agent_name,
+            )
+            self._pruner = PatchPruner(
+                self._llm_client,
+                config.override_base,
+                max_strategies=config.max_strategies,
+                max_hooks_per_category=config.max_hooks_per_category,
             )
             logger.info(f"MetaLoop: interactive LLM mode (model={config.llm_model})")
         else:
@@ -196,7 +221,7 @@ class _MetaLoopController:
         )
         self._promoter = Promoter(
             config=PromoterConfig(
-                accepted_patches_dir=str(Path(config.log_dir) / "accepted_patches"),
+                accepted_patches_dir=str(accepted_patches_dir),
             ),
             version_control=self._vc,
         )
@@ -205,6 +230,11 @@ class _MetaLoopController:
         self._candidate_counter = 0
         self._accumulated_traces: list = []
         self._trace_writer_initialized = False
+
+        # Pre-load existing patches from override_base into _ACTIVE_META_OVERRIDES
+        # so that baseline canary AND main RL sampling both use historical patches
+        # even after a training process restart.
+        self._preload_active_overrides()
 
         if trial_fn is not None:
             logger.info("MetaLoop: canary enabled (real Harbor Trial evaluation)")
@@ -233,15 +263,26 @@ class _MetaLoopController:
             config["task"] = {"path": task_path}
             config["agent"]["kwargs"]["session_id"] = uuid4().hex
 
+            # Keep meta overrides as plain Python dicts and inject them AFTER
+            # OmegaConf resolution. This prevents strings like "${CSV_HASH}"
+            # inside strategy text from being treated as OmegaConf interpolation.
+            overrides_for_agent: dict[str, Any] | None = None
+            hooks_dict: dict[str, Any] | None = None
             if meta_overrides:
                 overrides_for_agent = deepcopy(meta_overrides)
                 # Extract hooks and pass them separately
-                hooks_dict = overrides_for_agent.pop("_meta_hooks", None)
-                config["agent"]["kwargs"]["meta_overrides"] = overrides_for_agent
-                if hooks_dict:
-                    config["agent"]["kwargs"]["meta_hooks"] = hooks_dict
+                hooks_raw = overrides_for_agent.pop("_meta_hooks", None)
+                if isinstance(hooks_raw, dict) and hooks_raw:
+                    hooks_dict = hooks_raw
 
             config_dict = OmegaConf.to_container(config, resolve=True)
+            if not isinstance(config_dict, dict):
+                config_dict = {}
+            agent_kwargs = config_dict.setdefault("agent", {}).setdefault("kwargs", {})
+            if overrides_for_agent:
+                agent_kwargs["meta_overrides"] = overrides_for_agent
+            if hooks_dict:
+                agent_kwargs["meta_hooks"] = hooks_dict
             trial_config = TrialConfig.model_validate(config_dict)
             trial = Trial(trial_config)
 
@@ -306,23 +347,34 @@ class _MetaLoopController:
         else:
             diagnoses = self._diagnoser.diagnose(traces)
         logger.info(f"Meta: diagnosed {len(diagnoses)} problem types: {[d.problem_type for d in diagnoses]}")
+        diagnosis_suggestions_count = sum(len(d.strategy_suggestions) for d in diagnoses)
+        self._save_diagnosis_details(diagnoses)
 
         # ---- 3. Plan ----
         n_plan_samples = self.config.max_candidates
         if self._use_llm:
+            self._llm_planner.meta_step = self._batch_counter
             candidates = await self._llm_planner.plan_from_batch(
                 diagnoses, traces, n_samples=n_plan_samples
             )
         else:
             candidates = self._rule_planner.plan_from_batch(diagnoses)
             candidates = candidates[:n_plan_samples]
-        logger.info(f"Meta: generated {len(candidates)} patch candidates")
+        planned_candidate_count = len(candidates)
+        logger.info(f"Meta: generated {planned_candidate_count} patch candidates")
 
         metrics: dict[str, Any] = {
             "meta/cycle_batch": self._batch_counter,
             "meta/num_diagnoses": len(diagnoses),
+            "meta/diagnosis_strategy_suggestions_count": diagnosis_suggestions_count,
+            "meta/num_candidates_planned": planned_candidate_count,
             "meta/num_candidates": len(candidates),
         }
+
+        self._save_planner_details(
+            candidates,
+            planned_count=planned_candidate_count,
+        )
 
         if not candidates:
             return metrics, []
@@ -331,11 +383,18 @@ class _MetaLoopController:
         canary_task_paths = self._extract_canary_task_paths(traces, diagnoses)
         baseline_overrides = deepcopy(_ACTIVE_META_OVERRIDES) or None
 
-        candidate_deltas: list[float] = []
+        candidate_deltas: list[float | None] = [None] * len(candidates)
         promoted = 0
         rejected = 0
+        pruner_strategies_dropped = 0
+        pruner_hooks_dropped = 0
         best_candidate_overrides = None
         best_delta = float("-inf")
+        canary_report: dict[str, Any] = {
+            "task_paths": [str(p) for p in canary_task_paths],
+            "baseline": None,
+            "candidates": [],
+        }
 
         import shutil
         import tempfile
@@ -371,21 +430,81 @@ class _MetaLoopController:
                 for fe in remapped_candidate.files:
                     if fe.path.startswith(orig_base):
                         fe.path = fe.path.replace(orig_base, tmp_dir, 1)
-                patch_files = tmp_executor.apply(remapped_candidate)
+                tmp_executor.apply(remapped_candidate)
+
+                # Enforce strategy/hook limits on this candidate's merged patch-set
+                # (historical active patches + candidate edits) BEFORE canary.
+                prune_report = None
+                if self._pruner is not None:
+                    try:
+                        candidate_pruner = type(self._pruner)(
+                            self._llm_client,
+                            tmp_dir,
+                            max_strategies=self.config.max_strategies,
+                            max_hooks_per_category=self.config.max_hooks_per_category,
+                        )
+                        prune_report = await candidate_pruner.prune()
+                        self._append_jsonl("canary_details.jsonl", {
+                            "type": "pruner_result",
+                            "stage": "candidate_pre_canary",
+                            "cycle": self._batch_counter,
+                            "candidate_id": cid,
+                            "candidate_index": i,
+                            **prune_report,
+                        })
+                        pruner_strategies_dropped += prune_report.get("strategies", {}).get(
+                            "dropped", 0
+                        )
+                        pruner_hooks_dropped += sum(
+                            cat.get("dropped", 0)
+                            for cat in prune_report.get("hooks", {}).values()
+                        )
+                    except Exception as prune_exc:
+                        self._append_jsonl("canary_details.jsonl", {
+                            "type": "pruner_error",
+                            "stage": "candidate_pre_canary",
+                            "cycle": self._batch_counter,
+                            "candidate_id": cid,
+                            "candidate_index": i,
+                            "error": str(prune_exc),
+                        })
+                        raise RuntimeError(
+                            f"Candidate pruner failed for {cid}: {prune_exc}"
+                        ) from prune_exc
+
+                patch_files = self._list_patch_files_in_dir(tmp_dir)
                 overrides = self._load_override_content_from_dir(tmp_dir)
                 prepared.append({
                     "candidate": candidate,
                     "candidate_id": cid,
+                    "candidate_index": i,
                     "tmp_dir": tmp_dir,
                     "patch_files": patch_files,
+                    "prune_report": prune_report,
                     "overrides": overrides,
                 })
-                logger.info(f"Meta: prepared {cid} in {tmp_dir} → {len(patch_files)} files")
+                logger.info(f"Meta: prepared {cid} in {tmp_dir} -> {len(patch_files)} files")
             except Exception as e:
                 logger.error(f"Meta: error preparing {cid}: {e}")
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                candidate_deltas.append(-1.0)
+                metrics[f"meta/canary_candidate_{i}_avg_reward"] = 0.0
+                metrics[f"meta/canary_candidate_{i}_pass_rate"] = 0.0
+                candidate_deltas[i] = -1.0
                 rejected += 1
+                self._append_jsonl("canary_details.jsonl", {
+                    "type": "candidate_prepare_error",
+                    "cycle": self._batch_counter,
+                    "candidate_id": cid,
+                    "error": str(e),
+                })
+                canary_report["candidates"].append({
+                    "candidate_id": cid,
+                    "avg_reward": 0.0,
+                    "pass_rate": 0.0,
+                    "delta": -1.0,
+                    "decision": "prepare_error",
+                    "tasks": [],
+                })
 
         # Phase B: run baseline AND all candidates CONCURRENTLY
         if prepared:
@@ -410,22 +529,73 @@ class _MetaLoopController:
 
             if isinstance(baseline_result, Exception) or baseline_result is None:
                 logger.error(f"Meta: baseline canary failed: {baseline_result}")
+                metrics["meta/canary_baseline_avg_reward"] = 0.0
+                metrics["meta/canary_baseline_pass_rate"] = 0.0
                 candidate_deltas = [-1.0] * len(candidates)
+                for info in prepared:
+                    cand_idx = info["candidate_index"]
+                    metrics[f"meta/canary_candidate_{cand_idx}_avg_reward"] = 0.0
+                    metrics[f"meta/canary_candidate_{cand_idx}_pass_rate"] = 0.0
+                    canary_report["candidates"].append({
+                        "candidate_id": info["candidate_id"],
+                        "avg_reward": 0.0,
+                        "pass_rate": 0.0,
+                        "delta": -1.0,
+                        "decision": "baseline_error",
+                        "tasks": [],
+                    })
                 rejected = len(candidates)
+                self._append_jsonl("canary_details.jsonl", {
+                    "type": "baseline_error",
+                    "cycle": self._batch_counter,
+                    "error": str(baseline_result),
+                })
             else:
                 baseline_scores = baseline_result
+                baseline_summary = self._canary.summarize_scores(baseline_scores)
+                metrics["meta/canary_baseline_avg_reward"] = baseline_summary["avg_reward"]
+                metrics["meta/canary_baseline_pass_rate"] = baseline_summary["pass_rate"]
+                canary_report["baseline"] = baseline_summary
+                self._append_jsonl("canary_details.jsonl", {
+                    "type": "baseline_summary",
+                    "cycle": self._batch_counter,
+                    "avg_reward": baseline_summary["avg_reward"],
+                    "pass_rate": baseline_summary["pass_rate"],
+                    "num_tasks": len(baseline_scores),
+                    "scores": baseline_scores,
+                })
 
                 # Phase C: compare each candidate against baseline, pick the best
                 best_prepared = None
                 for info, raw_result in zip(prepared, candidate_raw_results):
+                    cand_idx = info["candidate_index"]
                     cid = info["candidate_id"]
                     if isinstance(raw_result, Exception):
                         logger.error(f"Meta: canary eval failed for {cid}: {raw_result}")
-                        candidate_deltas.append(-1.0)
+                        metrics[f"meta/canary_candidate_{cand_idx}_avg_reward"] = 0.0
+                        metrics[f"meta/canary_candidate_{cand_idx}_pass_rate"] = 0.0
+                        candidate_deltas[cand_idx] = -1.0
                         rejected += 1
+                        self._append_jsonl("canary_details.jsonl", {
+                            "type": "candidate_error",
+                            "cycle": self._batch_counter,
+                            "candidate_id": cid,
+                            "error": str(raw_result),
+                        })
+                        canary_report["candidates"].append({
+                            "candidate_id": cid,
+                            "avg_reward": 0.0,
+                            "pass_rate": 0.0,
+                            "delta": -1.0,
+                            "decision": "error",
+                            "tasks": [],
+                        })
                         continue
 
                     after_scores = raw_result
+                    candidate_summary = self._canary.summarize_scores(after_scores)
+                    metrics[f"meta/canary_candidate_{cand_idx}_avg_reward"] = candidate_summary["avg_reward"]
+                    metrics[f"meta/canary_candidate_{cand_idx}_pass_rate"] = candidate_summary["pass_rate"]
                     task_labels = [str(p) for p in canary_task_paths]
                     eval_result = self._canary._comparison.evaluate(
                         baseline_scores, after_scores,
@@ -435,10 +605,43 @@ class _MetaLoopController:
                     logger.info(
                         f"Canary {cid}: baseline_avg={sum(baseline_scores)/max(len(baseline_scores),1):.3f} "
                         f"candidate_avg={sum(after_scores)/max(len(after_scores),1):.3f} "
+                        f"baseline_pass_rate={baseline_summary['pass_rate']:.3f} "
+                        f"candidate_pass_rate={candidate_summary['pass_rate']:.3f} "
                         f"delta={eval_result.delta_score:.4f}"
                     )
 
-                    candidate_deltas.append(eval_result.delta_score)
+                    task_rows: list[dict[str, Any]] = []
+                    for task_path, before_score, after_score in zip(
+                        task_labels, baseline_scores, after_scores
+                    ):
+                        task_delta = after_score - before_score
+                        row = {
+                            "task_path": task_path,
+                            "baseline_reward": before_score,
+                            "candidate_reward": after_score,
+                            "delta": task_delta,
+                            "baseline_pass": before_score > 0,
+                            "candidate_pass": after_score > 0,
+                        }
+                        task_rows.append(row)
+                        self._append_jsonl("canary_details.jsonl", {
+                            "type": "task_detail",
+                            "cycle": self._batch_counter,
+                            "candidate_id": cid,
+                            **row,
+                        })
+
+                    self._append_jsonl("canary_details.jsonl", {
+                        "type": "candidate_summary",
+                        "cycle": self._batch_counter,
+                        "candidate_id": cid,
+                        "avg_reward": candidate_summary["avg_reward"],
+                        "pass_rate": candidate_summary["pass_rate"],
+                        "delta_score": eval_result.delta_score,
+                        "num_tasks": len(after_scores),
+                    })
+
+                    candidate_deltas[cand_idx] = eval_result.delta_score
                     decision = self._promoter.promote(
                         candidate_id=cid,
                         patch_files=info["patch_files"],
@@ -457,11 +660,24 @@ class _MetaLoopController:
                         f"Meta: {cid} → {decision.decision} "
                         f"(delta={decision.delta_score:.4f}, notes={decision.notes})"
                     )
+                    canary_report["candidates"].append({
+                        "candidate_id": cid,
+                        "avg_reward": candidate_summary["avg_reward"],
+                        "pass_rate": candidate_summary["pass_rate"],
+                        "delta": eval_result.delta_score,
+                        "decision": decision.decision,
+                        "tasks": task_rows,
+                    })
 
                 # Phase D: apply the best candidate to the real override_base
                 if best_prepared is not None:
                     self._vc.restore(pre_all_sha)
-                    self._executor.apply(best_prepared["candidate"])
+                    applied_files = self._sync_override_base_from_dir(best_prepared["tmp_dir"])
+                    logger.info(
+                        f"Meta: applied pruned winner {best_prepared['candidate_id']} "
+                        f"to override_base ({len(applied_files)} files)"
+                    )
+
                 else:
                     self._vc.restore(pre_all_sha)
 
@@ -471,11 +687,26 @@ class _MetaLoopController:
         else:
             # No prepared candidates (all failed during preparation) — skip canary entirely
             logger.warning("Meta: all candidates failed preparation, skipping canary evaluation")
+            metrics["meta/canary_baseline_avg_reward"] = 0.0
+            metrics["meta/canary_baseline_pass_rate"] = 0.0
             candidate_deltas = [-1.0] * len(candidates)
+            for cand_idx in range(len(candidates)):
+                metrics[f"meta/canary_candidate_{cand_idx}_avg_reward"] = 0.0
+                metrics[f"meta/canary_candidate_{cand_idx}_pass_rate"] = 0.0
             rejected = len(candidates)
+            self._append_jsonl("canary_details.jsonl", {
+                "type": "candidate_prepare_error",
+                "cycle": self._batch_counter,
+                "error": "all candidates failed preparation",
+            })
+
+        metrics["meta/pruner_strategies_dropped"] = pruner_strategies_dropped
+        metrics["meta/pruner_hooks_dropped"] = pruner_hooks_dropped
 
         if best_candidate_overrides is not None:
             self._inject_overrides_to_agent_config(best_candidate_overrides)
+
+        candidate_deltas = [d if d is not None else -1.0 for d in candidate_deltas]
 
         metrics.update({
             "meta/promoted": promoted,
@@ -484,7 +715,13 @@ class _MetaLoopController:
 
         # Write human-readable cycle summary
         self._save_cycle_summary(
-            diagnoses, candidates, candidate_deltas, promoted, rejected, best_delta,
+            diagnoses,
+            candidates,
+            candidate_deltas,
+            promoted,
+            rejected,
+            best_delta,
+            canary_report=canary_report,
         )
 
         # Record cycle outcome for cross-cycle diagnosis context
@@ -544,6 +781,159 @@ class _MetaLoopController:
 
         return metrics, meta_samples
 
+    def _append_jsonl(self, filename: str, record: dict[str, Any]) -> None:
+        """Append a single JSON object record under the run log directory."""
+        path = Path(self.config.log_dir) / filename
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.warning(f"Meta: failed writing {filename}: {e}")
+
+    @staticmethod
+    def _is_context_overflow_error(error_text: str) -> bool:
+        lower = str(error_text or "").lower()
+        return (
+            "maximum context length" in lower
+            or "parameter=input_tokens" in lower
+            or "context length is" in lower
+        )
+
+    def _compute_diagnosis_stats(self, worker_details: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate per-cycle diagnosis worker stats for observability."""
+        stats: dict[str, Any] = {
+            "total_workers": len(worker_details),
+            "ok_workers": 0,
+            "error_workers": 0,
+            "context_overflow_errors": 0,
+            "strategy_suggestions_total": 0,
+            "avg_turns_ok": None,
+            "min_turns_ok": None,
+            "max_turns_ok": None,
+            "by_category": {},
+        }
+        turns_ok: list[int] = []
+
+        for detail in worker_details:
+            category = str(detail.get("category", "unknown"))
+            bucket = stats["by_category"].setdefault(
+                category,
+                {
+                    "total": 0,
+                    "ok": 0,
+                    "error": 0,
+                    "context_overflow_errors": 0,
+                    "strategy_suggestions": 0,
+                },
+            )
+            bucket["total"] += 1
+
+            if detail.get("status") == "ok":
+                stats["ok_workers"] += 1
+                bucket["ok"] += 1
+                n_suggestions = int(detail.get("n_strategy_suggestions", 0) or 0)
+                stats["strategy_suggestions_total"] += n_suggestions
+                bucket["strategy_suggestions"] += n_suggestions
+                turns = detail.get("turns_used")
+                if isinstance(turns, int):
+                    turns_ok.append(turns)
+            else:
+                stats["error_workers"] += 1
+                bucket["error"] += 1
+                if self._is_context_overflow_error(detail.get("error", "")):
+                    stats["context_overflow_errors"] += 1
+                    bucket["context_overflow_errors"] += 1
+
+        if turns_ok:
+            stats["avg_turns_ok"] = sum(turns_ok) / len(turns_ok)
+            stats["min_turns_ok"] = min(turns_ok)
+            stats["max_turns_ok"] = max(turns_ok)
+
+        return stats
+
+    def _save_diagnosis_details(self, diagnoses: list) -> None:
+        """Persist diagnosis worker details + final diagnoses to diagnosis_details.jsonl."""
+        worker_details = getattr(self._diagnoser, "last_worker_details", []) or []
+        for detail in worker_details:
+            self._append_jsonl("diagnosis_details.jsonl", {
+                "type": "worker_detail",
+                "cycle": self._batch_counter,
+                **detail,
+            })
+
+        for d in diagnoses:
+            self._append_jsonl("diagnosis_details.jsonl", {
+                "type": "diagnosis",
+                "cycle": self._batch_counter,
+                "problem_type": d.problem_type,
+                "confidence": d.confidence,
+                "candidate_modules": d.candidate_modules,
+                "affected_task_ids": d.affected_task_ids,
+                "strategy_suggestions_count": len(d.strategy_suggestions),
+                "strategy_suggestions": d.strategy_suggestions,
+                "metadata": d.metadata,
+            })
+
+        stats = self._compute_diagnosis_stats(worker_details)
+        self._append_jsonl("diagnosis_details.jsonl", {
+            "type": "diagnosis_stats",
+            "cycle": self._batch_counter,
+            "num_diagnoses": len(diagnoses),
+            "problem_types": [d.problem_type for d in diagnoses],
+            **stats,
+        })
+        logger.info(
+            "Diagnosis stats: "
+            f"workers={stats['total_workers']}, "
+            f"ok={stats['ok_workers']}, "
+            f"errors={stats['error_workers']}, "
+            f"context_overflow_errors={stats['context_overflow_errors']}, "
+            f"strategy_suggestions={stats['strategy_suggestions_total']}"
+        )
+
+    def _save_planner_details(
+        self,
+        candidates: list,
+        *,
+        planned_count: int,
+    ) -> None:
+        """Persist planner sub-agent outputs and candidate summaries."""
+        self._append_jsonl("planner_details.jsonl", {
+            "type": "planner_summary",
+            "cycle": self._batch_counter,
+            "planned_candidates": planned_count,
+            "selected_candidates": len(candidates),
+        })
+
+        if self._use_llm and hasattr(self, "_llm_planner"):
+            for detail in self._llm_planner.last_subagent_details:
+                self._append_jsonl("planner_details.jsonl", {
+                    "type": "planner_subagent",
+                    "cycle": self._batch_counter,
+                    **detail,
+                })
+
+        for idx, candidate in enumerate(candidates):
+            self._append_jsonl("planner_details.jsonl", {
+                "type": "candidate",
+                "cycle": self._batch_counter,
+                "index": idx,
+                "target_modules": candidate.target_modules,
+                "risk": candidate.risk,
+                "required_tests": candidate.required_tests,
+                "rollback_if": candidate.rollback_if,
+                "notes": candidate.notes,
+                "files": [
+                    {
+                        "path": fe.path,
+                        "change_type": fe.change_type,
+                        "intent_preview": fe.intent[:300],
+                    }
+                    for fe in candidate.files
+                ],
+            })
+
     def _save_conversations(self, conversations, candidate_deltas: list[float]) -> None:
         """Persist LLM conversations to separate JSONL files by role.
 
@@ -595,6 +985,7 @@ class _MetaLoopController:
         promoted: int,
         rejected: int,
         best_delta: float,
+        canary_report: dict[str, Any] | None = None,
     ) -> None:
         """Append a human-readable cycle summary to {log_dir}/cycle_summary.log."""
         import os
@@ -619,6 +1010,35 @@ class _MetaLoopController:
                         f"  tasks={d.affected_task_ids[:3]}\n"
                     )
                     f.write(f"    hypothesis: {hyp[:120]}\n")
+                worker_details = getattr(self._diagnoser, "last_worker_details", []) or []
+                diagnosis_stats = self._compute_diagnosis_stats(worker_details)
+                if diagnosis_stats["total_workers"] > 0:
+                    f.write(
+                        "  worker_stats: "
+                        f"total={diagnosis_stats['total_workers']}, "
+                        f"ok={diagnosis_stats['ok_workers']}, "
+                        f"error={diagnosis_stats['error_workers']}, "
+                        f"context_overflow_error={diagnosis_stats['context_overflow_errors']}, "
+                        f"strategy_suggestions={diagnosis_stats['strategy_suggestions_total']}\n"
+                    )
+                    if diagnosis_stats["avg_turns_ok"] is not None:
+                        f.write(
+                            "  turns(ok_workers): "
+                            f"avg={diagnosis_stats['avg_turns_ok']:.2f}, "
+                            f"min={diagnosis_stats['min_turns_ok']}, "
+                            f"max={diagnosis_stats['max_turns_ok']}\n"
+                        )
+                    by_category = diagnosis_stats.get("by_category", {})
+                    for category in sorted(by_category.keys()):
+                        cat_stats = by_category[category]
+                        f.write(
+                            f"  category[{category}]: "
+                            f"total={cat_stats.get('total', 0)}, "
+                            f"ok={cat_stats.get('ok', 0)}, "
+                            f"error={cat_stats.get('error', 0)}, "
+                            f"context_overflow_error={cat_stats.get('context_overflow_errors', 0)}, "
+                            f"strategy_suggestions={cat_stats.get('strategy_suggestions', 0)}\n"
+                        )
                 f.write("\n")
 
                 # Candidate summary
@@ -629,11 +1049,42 @@ class _MetaLoopController:
                     status = "ACCEPTED" if delta is not None and delta > 0 else "REJECTED"
                     f.write(
                         f"  candidate_{i+1}: {cand.target_modules}"
-                        f"  risk={cand.risk}  delta={delta_str}  → {status}\n"
+                        f"  risk={cand.risk}  delta={delta_str}  -> {status}\n"
                     )
                     if cand.notes:
                         f.write(f"    notes: {cand.notes[:150]}\n")
                 f.write("\n")
+
+                if canary_report:
+                    baseline = canary_report.get("baseline")
+                    if baseline:
+                        f.write(
+                            "[Canary] baseline: "
+                            f"avg_reward={baseline.get('avg_reward', 0.0):.4f}, "
+                            f"pass_rate={baseline.get('pass_rate', 0.0):.4f}\n"
+                        )
+                    else:
+                        f.write("[Canary] baseline: unavailable\n")
+
+                    for c in canary_report.get("candidates", []):
+                        f.write(
+                            "  - "
+                            f"{c.get('candidate_id', 'unknown')}: "
+                            f"avg_reward={c.get('avg_reward', 0.0):.4f}, "
+                            f"pass_rate={c.get('pass_rate', 0.0):.4f}, "
+                            f"delta={c.get('delta', 0.0):+.4f}, "
+                            f"decision={c.get('decision', 'unknown')}\n"
+                        )
+                        for task in c.get("tasks", []):
+                            f.write(
+                                "      "
+                                f"task={task.get('task_path')} "
+                                f"baseline={task.get('baseline_reward', 0.0):.4f} "
+                                f"candidate={task.get('candidate_reward', 0.0):.4f} "
+                                f"delta={task.get('delta', 0.0):+.4f} "
+                                f"pass={task.get('candidate_pass', False)}\n"
+                            )
+                    f.write("\n")
 
                 # Overall result
                 f.write(f"[Result] promoted={promoted}, rejected={rejected}")
@@ -721,6 +1172,56 @@ class _MetaLoopController:
             result["_meta_hooks"] = hooks
 
         return result
+
+    def _list_patch_files_in_dir(self, directory: str) -> list[str]:
+        """Return normalized patch file paths in an override directory."""
+        base = Path(directory)
+        files: list[str] = []
+
+        sl_path = base / "strategy_library.yaml"
+        if sl_path.exists():
+            files.append(str(sl_path))
+
+        hooks_dir = base / "hooks"
+        if hooks_dir.is_dir():
+            for hf in sorted(hooks_dir.glob("*.py")):
+                files.append(str(hf))
+
+        return files
+
+    def _sync_override_base_from_dir(self, source_dir: str) -> list[str]:
+        """Replace active patch files with the evaluated candidate directory state."""
+        import shutil
+
+        src = Path(source_dir)
+        dst = self._override_base
+        applied_files: list[str] = []
+
+        # strategy_library.yaml
+        src_sl = src / "strategy_library.yaml"
+        dst_sl = dst / "strategy_library.yaml"
+        if src_sl.exists():
+            dst_sl.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_sl, dst_sl)
+            applied_files.append(str(dst_sl))
+        elif dst_sl.exists():
+            dst_sl.unlink()
+
+        # hooks/*.py
+        src_hooks = src / "hooks"
+        dst_hooks = dst / "hooks"
+        dst_hooks.mkdir(parents=True, exist_ok=True)
+
+        for existing in dst_hooks.glob("*.py"):
+            existing.unlink()
+
+        if src_hooks.is_dir():
+            for hf in sorted(src_hooks.glob("*.py")):
+                target = dst_hooks / hf.name
+                shutil.copy2(hf, target)
+                applied_files.append(str(target))
+
+        return applied_files
 
     def _extract_canary_task_paths(
         self, traces: list, diagnoses: list | None = None
@@ -812,17 +1313,54 @@ class _MetaLoopController:
             e for e in task_stats.values() if e["failures"] == 0 and e["successes"] > 0
         ]
 
-        # sort failures: diagnosed first, then by avg_reward ascending (worst first)
-        failed_tasks.sort(key=lambda e: (not e["diagnosed"], e["avg_reward"]))
+        diagnosed_failed = [e for e in failed_tasks if e["diagnosed"]]
+        undiagnosed_failed = [e for e in failed_tasks if not e["diagnosed"]]
+        diagnosed_failed.sort(key=lambda e: e["avg_reward"])
+        undiagnosed_failed.sort(key=lambda e: e["avg_reward"])
 
         # reserve 1 slot for regression detection (a successful task)
         regression_slots = min(1, max_tasks // 4, len(success_tasks))
         failure_slots = max_tasks - regression_slots
 
+        # Majority should be diagnosed tasks, but keep some unseen tasks.
+        diagnosed_ratio = min(max(float(self.config.canary_diagnosed_ratio), 0.0), 1.0)
+        desired_diagnosed = int(round(failure_slots * diagnosed_ratio))
+        desired_diagnosed = min(max(desired_diagnosed, 0), failure_slots)
+        desired_undiagnosed = failure_slots - desired_diagnosed
+
+        if failure_slots > 0:
+            desired_undiagnosed = max(desired_undiagnosed, int(self.config.canary_min_undiagnosed))
+            desired_undiagnosed = min(desired_undiagnosed, failure_slots)
+            desired_diagnosed = failure_slots - desired_undiagnosed
+
+        pick_diagnosed = min(desired_diagnosed, len(diagnosed_failed))
+        pick_undiagnosed = min(desired_undiagnosed, len(undiagnosed_failed))
+        remaining_failure_slots = failure_slots - pick_diagnosed - pick_undiagnosed
+        if remaining_failure_slots > 0:
+            extra_diag = min(
+                remaining_failure_slots,
+                len(diagnosed_failed) - pick_diagnosed,
+            )
+            pick_diagnosed += extra_diag
+            remaining_failure_slots -= extra_diag
+        if remaining_failure_slots > 0:
+            extra_undiag = min(
+                remaining_failure_slots,
+                len(undiagnosed_failed) - pick_undiagnosed,
+            )
+            pick_undiagnosed += extra_undiag
+            remaining_failure_slots -= extra_undiag
+
         paths: list = []
         seen: set[str] = set()
 
-        for entry in failed_tasks[:failure_slots]:
+        for entry in diagnosed_failed[:pick_diagnosed]:
+            key = str(entry["prompt"])
+            if key not in seen:
+                seen.add(key)
+                paths.append(entry["prompt"])
+
+        for entry in undiagnosed_failed[:pick_undiagnosed]:
             key = str(entry["prompt"])
             if key not in seen:
                 seen.add(key)
@@ -830,7 +1368,7 @@ class _MetaLoopController:
 
         # pick the success task with the highest reward (most likely to regress visibly)
         success_tasks.sort(key=lambda e: e["avg_reward"], reverse=True)
-        for entry in success_tasks:
+        for entry in success_tasks[:regression_slots]:
             if len(paths) >= max_tasks:
                 break
             key = str(entry["prompt"])
@@ -838,11 +1376,49 @@ class _MetaLoopController:
                 seen.add(key)
                 paths.append(entry["prompt"])
 
+        # Backfill if slots remain.
+        if len(paths) < max_tasks:
+            backfill_pool = diagnosed_failed[pick_diagnosed:] + undiagnosed_failed[pick_undiagnosed:] + success_tasks[regression_slots:]
+            for entry in backfill_pool:
+                if len(paths) >= max_tasks:
+                    break
+                key = str(entry["prompt"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                paths.append(entry["prompt"])
+
+        logger.info(
+            "Meta canary sampling: "
+            f"max={max_tasks}, failure_slots={failure_slots}, "
+            f"picked_diagnosed_fail={pick_diagnosed}, picked_undiagnosed_fail={pick_undiagnosed}, "
+            f"regression_success={regression_slots}, final={len(paths)}"
+        )
+
         return paths[:max_tasks]
 
     def _inject_overrides_to_agent_config(self, overrides: dict[str, dict]) -> None:
         """Store active overrides so HarborGenerator can inject them into trial config."""
         _ACTIVE_META_OVERRIDES.update(overrides)
+
+    def _preload_active_overrides(self) -> None:
+        """Load existing patches from override_base into _ACTIVE_META_OVERRIDES.
+
+        Called once during __init__ so that after a process restart, both the
+        main RL sampling loop and the canary baseline automatically use
+        previously adopted patches (strategy_library + hooks).
+        """
+        overrides = self._load_override_content_from_dir(str(self._override_base))
+        if overrides:
+            _ACTIVE_META_OVERRIDES.update(overrides)
+            strat_count = len(overrides.get("strategy_library", {}))
+            hook_count = len(overrides.get("_meta_hooks", {}))
+            logger.info(
+                f"MetaLoop: preloaded active overrides from {self._override_base} "
+                f"({strat_count} strategies, {hook_count} hooks)"
+            )
+        else:
+            logger.info("MetaLoop: no existing patches to preload")
 
     def flush(self, run_name: str) -> None:
         """Flush any remaining accumulated traces and release file handles."""

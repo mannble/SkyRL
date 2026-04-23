@@ -38,7 +38,6 @@ def build_terminus_registry(base_path: str = "terminus") -> ModuleRegistry:
         ("hook:before_execute", "Transform or reorder commands before execution"),
         ("hook:after_execute", "Transform terminal output before it becomes the next prompt"),
         ("hook:on_timeout", "Custom handling when a command times out"),
-        ("hook:on_parse_error", "Custom recovery prompt when LLM output fails to parse"),
         ("hook:before_llm_call", "Transform the prompt just before sending to the LLM"),
         ("hook:after_round", "Post-round control: inject text to verify completion, detect loops, guide agent"),
     ]:

@@ -7,6 +7,7 @@ Write targets:
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ _OVERRIDE_SCHEMA = {
         "strategies",
     ],
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _timestamp() -> str:
@@ -226,13 +229,18 @@ class PatchExecutor:
 
         try:
             from skyrl_agent.meta_toolkit.hooks.hook_executor import (
-                _validate_hook_source, HookPoint,
+                _parse_hook_filename,
+                _validate_hook_source,
+                HookPoint,
             )
-            hook_name = path.stem
-            try:
-                hp = HookPoint(hook_name)
-            except ValueError:
-                hp = None
+            hp = None
+            parsed = _parse_hook_filename(path.name)
+            if parsed is not None:
+                hp_name, _ = parsed
+                try:
+                    hp = HookPoint(hp_name)
+                except ValueError:
+                    hp = None
             errors = _validate_hook_source(source, hp)
             if errors:
                 _logger.error(f"Hook validation failed for {path.name}: {errors}")

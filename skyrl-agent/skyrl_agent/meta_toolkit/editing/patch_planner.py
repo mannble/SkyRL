@@ -1,9 +1,8 @@
 """Patch planner: generates PatchCandidate objects from DiagnosisResult + ModuleRegistry.
 
 Supports patching of:
-  - planner_policy, retry_policy, verification_policy, finish_policy (YAML overrides)
-  - system_prompt_overrides, strategy_library (prompt-level)
-  - behavior_policy (code-level behavioral hooks)
+  - strategy_library (prompt-level)
+  - hook:* (code-level hooks)
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from skyrl_agent.meta_toolkit.editing.patch_schema import ChangeType, PatchCandi
 _ALLOWED_PHASE1_MODULES: frozenset[str] = frozenset([
     "strategy_library",
     "hook:before_llm_call", "hook:before_execute", "hook:after_execute",
-    "hook:on_timeout", "hook:on_parse_error", "hook:after_round",
+    "hook:on_timeout", "hook:after_round",
 ])
 
 _MODULE_OVERRIDE_FILE: dict[str, str] = {
@@ -28,7 +27,6 @@ _PROBLEM_MODULE_PRIORITY: dict[str, list[str]] = {
     "sync_bottleneck": ["strategy_library"],
     "timeout": ["strategy_library"],
     "verification_failure": ["strategy_library"],
-    "recovery_failure": ["strategy_library"],
     "termination_failure": ["strategy_library"],
     "planning_failure": ["strategy_library"],
     "context_overload": ["strategy_library"],

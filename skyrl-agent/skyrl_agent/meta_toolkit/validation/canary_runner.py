@@ -63,6 +63,17 @@ class CanaryRunner:
     def has_trial_runner(self) -> bool:
         return self._trial_fn is not None
 
+    @staticmethod
+    def summarize_scores(scores: list[float]) -> dict[str, float]:
+        """Return average reward and pass rate for per-task score lists."""
+        if not scores:
+            return {"avg_reward": 0.0, "pass_rate": 0.0}
+        passed = sum(1 for s in scores if s > 0)
+        return {
+            "avg_reward": sum(scores) / len(scores),
+            "pass_rate": passed / len(scores),
+        }
+
     # ------------------------------------------------------------------
     # Public API: run baseline once, evaluate candidates against it
     # ------------------------------------------------------------------
@@ -232,10 +243,18 @@ class CanaryRunner:
         for task_idx, reward in results:
             per_task.setdefault(task_idx, []).append(reward)
 
-        return [
-            sum(per_task.get(i, [0.0])) / max(len(per_task.get(i, [0.0])), 1)
-            for i in range(len(task_paths))
-        ]
+        per_task_avg: list[float] = []
+        for i, task_path in enumerate(task_paths):
+            values = per_task.get(i, [0.0])
+            avg = sum(values) / max(len(values), 1)
+            per_task_avg.append(avg)
+            passed = sum(1 for v in values if v > 0)
+            logger.info(
+                f"Canary [{label}] task[{i}] avg_reward={avg:.3f} "
+                f"pass_rate={passed}/{len(values)} path={task_path}"
+            )
+
+        return per_task_avg
 
 
 def _placeholder_result(candidate_id: str, reason: str) -> CanaryRunResult:

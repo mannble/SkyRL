@@ -30,12 +30,11 @@ class DiagnosisResult:
 _MODULE_MAP: dict[str, list[str]] = {
     "timeout": ["hook:on_timeout", "hook:before_execute", "strategy_library"],
     "verification_failure": ["hook:after_round", "strategy_library"],
-    "recovery_failure": ["hook:on_parse_error", "hook:before_llm_call", "strategy_library"],
     "termination_failure": ["hook:after_round", "strategy_library"],
     "planning_failure": ["hook:before_llm_call", "strategy_library"],
     "context_overload": ["hook:after_execute", "hook:after_round", "strategy_library"],
     "sync_bottleneck": ["hook:before_execute", "strategy_library"],
-    "tool_exhaustion": ["hook:before_llm_call", "hook:on_parse_error", "strategy_library"],
+    "tool_exhaustion": ["hook:before_llm_call", "strategy_library"],
     "low_reward": ["hook:after_round", "hook:before_llm_call", "strategy_library"],
     "general": ["strategy_library"],
 }
@@ -91,15 +90,6 @@ _RULES: list[dict[str, Any]] = [
         "min_prevalence": 0.1,
     },
     {
-        "id": "recovery_needed",
-        "check": lambda batch, stats: stats["failure_with_tool_errors"] >= 2,
-        "problem_type": "recovery_failure",
-        "hypotheses": [
-            "Tool errors occur and agent does not recover; retry policy insufficient",
-        ],
-        "min_prevalence": 0.05,
-    },
-    {
         "id": "termination_premature",
         "check": lambda batch, stats: stats["success_count"] == 0 and stats["avg_turns"] <= 3,
         "problem_type": "termination_failure",
@@ -147,7 +137,6 @@ def _compute_stats(traces: list[TraceRecord]) -> dict[str, Any]:
         "verification_failures": sum(
             1 for t in traces if "verification_failure" in t.failure_tags
         ),
-        "recovery_failures": sum(1 for t in traces if "recovery_failure" in t.failure_tags),
         "planning_failures": sum(1 for t in traces if "planning_failure" in t.failure_tags),
     }
 
@@ -242,8 +231,6 @@ class RuleBasedDiagnoser:
             return trace.finish_reason == "context_length" or "context_overload" in trace.failure_tags
         if problem_type == "verification_failure":
             return "verification_failure" in trace.failure_tags
-        if problem_type == "recovery_failure":
-            return "recovery_failure" in trace.failure_tags
         if problem_type == "termination_failure":
             return "termination_failure" in trace.failure_tags
         if problem_type == "planning_failure":
@@ -272,10 +259,6 @@ def _match_verification(t: TraceRecord) -> bool:
     return "verification_failure" in t.failure_tags
 
 
-def _match_recovery(t: TraceRecord) -> bool:
-    return "recovery_failure" in t.failure_tags
-
-
 def _match_termination(t: TraceRecord) -> bool:
     return "termination_failure" in t.failure_tags
 
@@ -297,7 +280,6 @@ _TRACE_MATCH_FNS: dict[str, callable] = {
     "timeout": _match_timeout,
     "context_overload": _match_context,
     "verification_missing": _match_verification,
-    "recovery_needed": _match_recovery,
     "termination_premature": _match_termination,
     "planning_weak": _match_planning,
     "tool_exhaustion": _match_tool_exhaustion,
