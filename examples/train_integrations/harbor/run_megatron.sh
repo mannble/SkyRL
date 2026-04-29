@@ -31,7 +31,7 @@ EVAL_DATA="['$DATA_DIR/OpenThoughts-TB-dev']"
 #-----------------------
 MODEL_NAME="/home/test/test1714/wxh/Qwen3.5-9B"
 SERVED_MODEL_NAME="Qwen3.5-9B"
-RUN_NAME="ET-meta1-terminus2-qwen3_5_9b_megatron"
+RUN_NAME="ET-meta4-terminus2-qwen3_5_9b_megatron"
 TRIALS_DIR="/home/test/test1714/wxh/skyrl/$RUN_NAME/trials_run"
 CKPTS_DIR="/home/test/test1714/wxh/skyrl/$RUN_NAME/ckpts"
 EXPORTS_DIR="/home/test/test1714/wxh/skyrl/$RUN_NAME/exports"

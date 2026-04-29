@@ -29,18 +29,9 @@ from a terminal-based AI agent and must diagnose failure patterns.
 The agent operates in a loop: receive prompt → call LLM → parse response →
 execute commands in terminal → observe output → repeat.
 
-The following **patchable policy modules** control its behavior — each can be
-tuned via YAML overrides or code hooks:
-
-| Module | Responsibility |
-|--------|---------------|
-| planner_policy | Task decomposition, sub-goal generation, planning style |
-| retry_policy | Error recovery, retry count/delay, fallback strategy |
-| verification_policy | Post-step verification, acceptance threshold |
-| finish_policy | Termination decision, early-exit threshold |
-| system_prompt_overrides | Strategy hints injected into agent prompt |
-| strategy_library | Pattern-matched step-by-step strategies |
-| behavior_policy | Command filtering, output limits, loop detection |
+The downstream planner will decide whether a diagnosis should become a
+strategy edit or a runtime hook. Your job is only to describe failure patterns
+and their evidence.
 
 ## Known problem types
 
@@ -70,9 +61,6 @@ uses your diagnosis to select the right fix strategy.
 3. Check wall_clock_ms vs turns: high ratio → wasteful_waiting.
 4. Check tool_failures count: high → parse_error_loop or recovery_failure.
 5. A single trace can contribute to multiple diagnoses.
-6. Always include `candidate_modules` — these tell the planner which modules
-   to modify. Include `system_prompt_overrides`, `strategy_library`, and
-   `behavior_policy` when relevant, not just the four core modules.
 
 ## Output format
 
@@ -83,14 +71,13 @@ Each object has:
 {
   "problem_type": "<string>",
   "root_cause_hypotheses": ["<string>", ...],
-  "candidate_modules": ["<module_name>", ...],
   "confidence": <float 0-1>,
-  "affected_task_ids": ["<task_id>", ...]
+  "affected_trace_ids": ["<trajectory_id, e.g. 749-traj3>", ...]
 }
 ```
 
 If no issues are found, return an empty array `[]`.
-Be specific in hypotheses — reference concrete trace evidence (task IDs,
+Be specific in hypotheses — reference concrete trace evidence (trajectory IDs,
 turn counts, finish reasons, tool failure counts, etc.).
 """
 
@@ -125,9 +112,12 @@ def _parse_diagnoses(raw: list[dict[str, Any]]) -> list[DiagnosisResult]:
             DiagnosisResult(
                 problem_type=obj.get("problem_type", "general"),
                 root_cause_hypotheses=obj.get("root_cause_hypotheses", []),
-                candidate_modules=obj.get("candidate_modules", ["planner_policy"]),
+                candidate_modules=[],
                 confidence=float(obj.get("confidence", 0.5)),
-                affected_task_ids=obj.get("affected_task_ids", []),
+                affected_task_ids=(
+                    obj.get("affected_trace_ids")
+                    or obj.get("affected_task_ids", [])
+                ),
                 metadata={"source": "llm"},
             )
         )

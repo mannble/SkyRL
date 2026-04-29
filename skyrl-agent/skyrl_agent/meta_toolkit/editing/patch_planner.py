@@ -15,7 +15,7 @@ from skyrl_agent.meta_toolkit.editing.patch_schema import ChangeType, PatchCandi
 
 _ALLOWED_PHASE1_MODULES: frozenset[str] = frozenset([
     "strategy_library",
-    "hook:before_llm_call", "hook:before_execute", "hook:after_execute",
+    "hook:before_llm_call", "hook:after_execute",
     "hook:on_timeout", "hook:after_round",
 ])
 
@@ -29,7 +29,7 @@ _PROBLEM_MODULE_PRIORITY: dict[str, list[str]] = {
     "verification_failure": ["strategy_library"],
     "termination_failure": ["strategy_library"],
     "planning_failure": ["strategy_library"],
-    "context_overload": ["strategy_library"],
+    "context_overload": [],
     "tool_exhaustion": ["strategy_library"],
     "low_reward": ["strategy_library"],
     "general": ["strategy_library"],

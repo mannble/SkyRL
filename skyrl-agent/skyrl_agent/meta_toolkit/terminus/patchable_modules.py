@@ -35,11 +35,10 @@ def build_terminus_registry(base_path: str = "terminus") -> ModuleRegistry:
     # ---- Code hooks: model-generated Python injected into agent loop ----
 
     for hook_name, hook_desc in [
-        ("hook:before_execute", "Transform or reorder commands before execution"),
-        ("hook:after_execute", "Transform terminal output before it becomes the next prompt"),
-        ("hook:on_timeout", "Custom handling when a command times out"),
-        ("hook:before_llm_call", "Transform the prompt just before sending to the LLM"),
-        ("hook:after_round", "Post-round control: inject text to verify completion, detect loops, guide agent"),
+        ("hook:after_execute", "Observe terminal output and update hook context signals"),
+        ("hook:on_timeout", "Observe command timeouts and update hook context signals"),
+        ("hook:before_llm_call", "Append short prompt guidance just before sending to the LLM"),
+        ("hook:after_round", "Append prompt guidance and request limited continuation for concrete runtime errors"),
     ]:
         registry.register(
             PatchableModule(

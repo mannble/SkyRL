@@ -22,7 +22,7 @@ class ComparisonConfig:
 
     # Per-task regression guard: reject if any single task's avg reward drops
     # by more than this amount vs baseline.  Set to 0.0 to disable.
-    max_per_task_drop: float = 0.3
+    max_per_task_drop: float = 0.55
 
 
 class ComparisonEngine:

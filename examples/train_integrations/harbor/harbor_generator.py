@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -42,6 +43,11 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 # We have N retries for each trial, if one of the rollout (out of n_samples_per_prompt) fails
 # after N attempts, we skip this prompt altogether.
 MAX_NUM_RETRIES_PER_TRIAL = 2
+_IGNORED_PATCH_PROBLEM_TYPES = {"context_overload", "context_length"}
+
+
+def _normalize_problem_type(problem_type: str) -> str:
+    return str(problem_type or "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
 @dataclass
@@ -73,7 +79,16 @@ class MetaLoopConfig:
 
     # Patch library limits (enforced by PatchPruner)
     max_strategies: int = 32
-    max_hooks_per_category: int = 8
+    max_hook_groups: int = 8
+    max_hooks_per_category: Optional[int] = None  # legacy alias for max_hook_groups
+
+    @property
+    def hook_group_budget(self) -> int:
+        return (
+            self.max_hooks_per_category
+            if self.max_hooks_per_category is not None
+            else self.max_hook_groups
+        )
 
     @classmethod
     def from_cfg(cls, cfg) -> "MetaLoopConfig":
@@ -183,7 +198,7 @@ class _MetaLoopController:
                 self._llm_client,
                 config.override_base,
                 max_strategies=config.max_strategies,
-                max_hooks_per_category=config.max_hooks_per_category,
+                max_hook_groups=config.hook_group_budget,
             )
             logger.info(f"MetaLoop: interactive LLM mode (model={config.llm_model})")
         else:
@@ -240,6 +255,14 @@ class _MetaLoopController:
             logger.info("MetaLoop: canary enabled (real Harbor Trial evaluation)")
         else:
             logger.info("MetaLoop: canary placeholder (no trial runner)")
+
+    @staticmethod
+    def _filter_patchable_diagnoses(diagnoses: list) -> list:
+        """Drop diagnosis types that should not produce meta patches."""
+        return [
+            d for d in diagnoses
+            if _normalize_problem_type(getattr(d, "problem_type", "")) not in _IGNORED_PATCH_PROBLEM_TYPES
+        ]
 
     def _build_trial_fn(self):
         """Build an async callable that runs a single Harbor Trial and returns its reward.
@@ -346,9 +369,16 @@ class _MetaLoopController:
             diagnoses = await self._diagnoser.diagnose(traces)
         else:
             diagnoses = self._diagnoser.diagnose(traces)
+        raw_diagnosis_count = len(diagnoses)
+        diagnoses = self._filter_patchable_diagnoses(diagnoses)
+        if len(diagnoses) != raw_diagnosis_count:
+            logger.info(
+                "Meta: ignored {} context-length/context-overload diagnoses before planning",
+                raw_diagnosis_count - len(diagnoses),
+            )
         logger.info(f"Meta: diagnosed {len(diagnoses)} problem types: {[d.problem_type for d in diagnoses]}")
         diagnosis_suggestions_count = sum(len(d.strategy_suggestions) for d in diagnoses)
-        self._save_diagnosis_details(diagnoses)
+        self._save_diagnosis_events(diagnoses)
 
         # ---- 3. Plan ----
         n_plan_samples = self.config.max_candidates
@@ -371,7 +401,7 @@ class _MetaLoopController:
             "meta/num_candidates": len(candidates),
         }
 
-        self._save_planner_details(
+        self._save_planner_events(
             candidates,
             planned_count=planned_candidate_count,
         )
@@ -401,13 +431,17 @@ class _MetaLoopController:
 
         # Pre-snapshot before any candidate modifications
         pre_all_sha = self._vc.snapshot(label="pre-all-candidates")
+        active_patch_signature = self._patch_content_signature_from_dir(self._override_base)
 
         # Phase A: prepare each candidate in an isolated temp directory
         prepared: list[dict] = []
+        noop_skipped = 0
+        noop_delta = -0.05
         for i, candidate in enumerate(candidates):
             self._candidate_counter += 1
             cid = f"candidate_{self._candidate_counter}"
-            tmp_dir = tempfile.mkdtemp(prefix=f"meta_canary_{cid}_")
+            tmp_ctx = tempfile.TemporaryDirectory(prefix=f"meta_canary_{cid}_")
+            tmp_dir = tmp_ctx.name
             try:
                 src_base = str(self._override_base)
                 for item in Path(src_base).iterdir():
@@ -441,10 +475,10 @@ class _MetaLoopController:
                             self._llm_client,
                             tmp_dir,
                             max_strategies=self.config.max_strategies,
-                            max_hooks_per_category=self.config.max_hooks_per_category,
+                            max_hook_groups=self.config.hook_group_budget,
                         )
                         prune_report = await candidate_pruner.prune()
-                        self._append_jsonl("canary_details.jsonl", {
+                        self._append_jsonl("canary", {
                             "type": "pruner_result",
                             "stage": "candidate_pre_canary",
                             "cycle": self._batch_counter,
@@ -460,7 +494,7 @@ class _MetaLoopController:
                             for cat in prune_report.get("hooks", {}).values()
                         )
                     except Exception as prune_exc:
-                        self._append_jsonl("canary_details.jsonl", {
+                        self._append_jsonl("canary", {
                             "type": "pruner_error",
                             "stage": "candidate_pre_canary",
                             "cycle": self._batch_counter,
@@ -474,11 +508,41 @@ class _MetaLoopController:
 
                 patch_files = self._list_patch_files_in_dir(tmp_dir)
                 overrides = self._load_override_content_from_dir(tmp_dir)
+                candidate_patch_signature = self._patch_content_signature_from_dir(tmp_dir)
+                if candidate_patch_signature == active_patch_signature:
+                    noop_skipped += 1
+                    rejected += 1
+                    candidate_deltas[i] = noop_delta
+                    metrics[f"meta/canary_candidate_{i}_avg_reward"] = 0.0
+                    metrics[f"meta/canary_candidate_{i}_pass_rate"] = 0.0
+                    self._append_jsonl("canary", {
+                        "type": "candidate_noop_skip",
+                        "cycle": self._batch_counter,
+                        "candidate_id": cid,
+                        "candidate_index": i,
+                        "delta": noop_delta,
+                        "reason": "candidate patch content unchanged after apply+prune",
+                    })
+                    canary_report["candidates"].append({
+                        "candidate_id": cid,
+                        "avg_reward": 0.0,
+                        "pass_rate": 0.0,
+                        "delta": noop_delta,
+                        "decision": "noop_skip",
+                        "tasks": [],
+                    })
+                    logger.info(
+                        f"Meta: skipping {cid}; patch content unchanged after apply+prune"
+                    )
+                    tmp_ctx.cleanup()
+                    continue
+
                 prepared.append({
                     "candidate": candidate,
                     "candidate_id": cid,
                     "candidate_index": i,
                     "tmp_dir": tmp_dir,
+                    "tmp_ctx": tmp_ctx,
                     "patch_files": patch_files,
                     "prune_report": prune_report,
                     "overrides": overrides,
@@ -486,12 +550,12 @@ class _MetaLoopController:
                 logger.info(f"Meta: prepared {cid} in {tmp_dir} -> {len(patch_files)} files")
             except Exception as e:
                 logger.error(f"Meta: error preparing {cid}: {e}")
-                shutil.rmtree(tmp_dir, ignore_errors=True)
+                tmp_ctx.cleanup()
                 metrics[f"meta/canary_candidate_{i}_avg_reward"] = 0.0
                 metrics[f"meta/canary_candidate_{i}_pass_rate"] = 0.0
                 candidate_deltas[i] = -1.0
                 rejected += 1
-                self._append_jsonl("canary_details.jsonl", {
+                self._append_jsonl("canary", {
                     "type": "candidate_prepare_error",
                     "cycle": self._batch_counter,
                     "candidate_id": cid,
@@ -545,7 +609,7 @@ class _MetaLoopController:
                         "tasks": [],
                     })
                 rejected = len(candidates)
-                self._append_jsonl("canary_details.jsonl", {
+                self._append_jsonl("canary", {
                     "type": "baseline_error",
                     "cycle": self._batch_counter,
                     "error": str(baseline_result),
@@ -556,7 +620,7 @@ class _MetaLoopController:
                 metrics["meta/canary_baseline_avg_reward"] = baseline_summary["avg_reward"]
                 metrics["meta/canary_baseline_pass_rate"] = baseline_summary["pass_rate"]
                 canary_report["baseline"] = baseline_summary
-                self._append_jsonl("canary_details.jsonl", {
+                self._append_jsonl("canary", {
                     "type": "baseline_summary",
                     "cycle": self._batch_counter,
                     "avg_reward": baseline_summary["avg_reward"],
@@ -565,8 +629,11 @@ class _MetaLoopController:
                     "scores": baseline_scores,
                 })
 
-                # Phase C: compare each candidate against baseline, pick the best
+                # Phase C: compare each candidate against baseline, shortlist
+                # acceptable candidates, then promote only the single best one.
                 best_prepared = None
+                best_eval_result = None
+                best_patch_files: list[str] = []
                 for info, raw_result in zip(prepared, candidate_raw_results):
                     cand_idx = info["candidate_index"]
                     cid = info["candidate_id"]
@@ -576,7 +643,7 @@ class _MetaLoopController:
                         metrics[f"meta/canary_candidate_{cand_idx}_pass_rate"] = 0.0
                         candidate_deltas[cand_idx] = -1.0
                         rejected += 1
-                        self._append_jsonl("canary_details.jsonl", {
+                        self._append_jsonl("canary", {
                             "type": "candidate_error",
                             "cycle": self._batch_counter,
                             "candidate_id": cid,
@@ -624,14 +691,14 @@ class _MetaLoopController:
                             "candidate_pass": after_score > 0,
                         }
                         task_rows.append(row)
-                        self._append_jsonl("canary_details.jsonl", {
+                        self._append_jsonl("canary", {
                             "type": "task_detail",
                             "cycle": self._batch_counter,
                             "candidate_id": cid,
                             **row,
                         })
 
-                    self._append_jsonl("canary_details.jsonl", {
+                    self._append_jsonl("canary", {
                         "type": "candidate_summary",
                         "cycle": self._batch_counter,
                         "candidate_id": cid,
@@ -642,20 +709,20 @@ class _MetaLoopController:
                     })
 
                     candidate_deltas[cand_idx] = eval_result.delta_score
-                    decision = self._promoter.promote(
+                    decision = self._promoter.decide(
                         candidate_id=cid,
-                        patch_files=info["patch_files"],
                         eval_result=eval_result,
-                        cycle=self._batch_counter,
+                        write_record=False,
                     )
                     if decision.decision == "accept":
-                        promoted += 1
                         if eval_result.delta_score > best_delta:
                             best_delta = eval_result.delta_score
                             best_candidate_overrides = info["overrides"]
                             best_prepared = info
+                            best_eval_result = eval_result
+                            best_patch_files = info["patch_files"]
                     else:
-                        rejected += 1
+                        pass
                     logger.info(
                         f"Meta: {cid} → {decision.decision} "
                         f"(delta={decision.delta_score:.4f}, notes={decision.notes})"
@@ -665,14 +732,23 @@ class _MetaLoopController:
                         "avg_reward": candidate_summary["avg_reward"],
                         "pass_rate": candidate_summary["pass_rate"],
                         "delta": eval_result.delta_score,
-                        "decision": decision.decision,
+                        "decision": "eligible" if decision.decision == "accept" else "reject",
                         "tasks": task_rows,
                     })
 
                 # Phase D: apply the best candidate to the real override_base
-                if best_prepared is not None:
+                if best_prepared is not None and best_eval_result is not None:
                     self._vc.restore(pre_all_sha)
                     applied_files = self._sync_override_base_from_dir(best_prepared["tmp_dir"])
+                    final_decision = self._promoter.promote(
+                        candidate_id=best_prepared["candidate_id"],
+                        patch_files=applied_files or best_patch_files,
+                        eval_result=best_eval_result,
+                        cycle=self._batch_counter,
+                    )
+                    promoted = 1 if final_decision.decision == "accept" else 0
+                    rejected = max(0, len(candidates) - promoted)
+                    canary_report["winner_candidate_id"] = best_prepared["candidate_id"]
                     logger.info(
                         f"Meta: applied pruned winner {best_prepared['candidate_id']} "
                         f"to override_base ({len(applied_files)} files)"
@@ -680,28 +756,49 @@ class _MetaLoopController:
 
                 else:
                     self._vc.restore(pre_all_sha)
+                    promoted = 0
+                    rejected = len(candidates)
 
             # Cleanup temp directories
             for info in prepared:
-                shutil.rmtree(info["tmp_dir"], ignore_errors=True)
+                tmp_ctx = info.get("tmp_ctx")
+                if tmp_ctx is not None:
+                    tmp_ctx.cleanup()
+                else:
+                    shutil.rmtree(info["tmp_dir"], ignore_errors=True)
         else:
-            # No prepared candidates (all failed during preparation) — skip canary entirely
-            logger.warning("Meta: all candidates failed preparation, skipping canary evaluation")
+            # No prepared candidates — all were no-op and/or failed during preparation.
+            if noop_skipped:
+                logger.info(
+                    "Meta: no changed candidates prepared "
+                    f"({noop_skipped} no-op, {len(candidates) - noop_skipped} prepare errors); "
+                    "skipping canary evaluation"
+                )
+                self._append_jsonl("canary", {
+                    "type": "all_candidates_skipped",
+                    "cycle": self._batch_counter,
+                    "noop_skipped": noop_skipped,
+                    "reason": "no candidate changed patch content after apply+prune",
+                })
+            else:
+                logger.warning("Meta: all candidates failed preparation, skipping canary evaluation")
+                self._append_jsonl("canary", {
+                    "type": "candidate_prepare_error",
+                    "cycle": self._batch_counter,
+                    "error": "all candidates failed preparation",
+                })
             metrics["meta/canary_baseline_avg_reward"] = 0.0
             metrics["meta/canary_baseline_pass_rate"] = 0.0
-            candidate_deltas = [-1.0] * len(candidates)
             for cand_idx in range(len(candidates)):
+                if candidate_deltas[cand_idx] is None:
+                    candidate_deltas[cand_idx] = -1.0
                 metrics[f"meta/canary_candidate_{cand_idx}_avg_reward"] = 0.0
                 metrics[f"meta/canary_candidate_{cand_idx}_pass_rate"] = 0.0
-            rejected = len(candidates)
-            self._append_jsonl("canary_details.jsonl", {
-                "type": "candidate_prepare_error",
-                "cycle": self._batch_counter,
-                "error": "all candidates failed preparation",
-            })
+            rejected = max(rejected, len(candidates))
 
         metrics["meta/pruner_strategies_dropped"] = pruner_strategies_dropped
         metrics["meta/pruner_hooks_dropped"] = pruner_hooks_dropped
+        metrics["meta/candidates_noop_skipped"] = noop_skipped
 
         if best_candidate_overrides is not None:
             self._inject_overrides_to_agent_config(best_candidate_overrides)
@@ -782,14 +879,21 @@ class _MetaLoopController:
         return metrics, meta_samples
 
     def _append_jsonl(self, filename: str, record: dict[str, Any]) -> None:
-        """Append a single JSON object record under the run log directory."""
-        path = Path(self.config.log_dir) / filename
+        """Append a machine-readable meta event to the unified event log.
+
+        ``filename`` is kept as a logical stream name for call-site clarity,
+        but all structured details are written to one file so each meta run has
+        a small, predictable log surface.
+        """
+        path = Path(self.config.log_dir) / "events.jsonl"
+        stream = Path(filename).stem
+        payload = {"stream": stream, **record}
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception as e:
-            logger.warning(f"Meta: failed writing {filename}: {e}")
+            logger.warning(f"Meta: failed writing events.jsonl ({stream}): {e}")
 
     @staticmethod
     def _is_context_overflow_error(error_text: str) -> bool:
@@ -852,31 +956,31 @@ class _MetaLoopController:
 
         return stats
 
-    def _save_diagnosis_details(self, diagnoses: list) -> None:
-        """Persist diagnosis worker details + final diagnoses to diagnosis_details.jsonl."""
+    def _save_diagnosis_events(self, diagnoses: list) -> None:
+        """Persist diagnosis worker details and final diagnoses to events.jsonl."""
         worker_details = getattr(self._diagnoser, "last_worker_details", []) or []
         for detail in worker_details:
-            self._append_jsonl("diagnosis_details.jsonl", {
+            self._append_jsonl("diagnosis", {
                 "type": "worker_detail",
                 "cycle": self._batch_counter,
                 **detail,
             })
 
         for d in diagnoses:
-            self._append_jsonl("diagnosis_details.jsonl", {
+            self._append_jsonl("diagnosis", {
                 "type": "diagnosis",
                 "cycle": self._batch_counter,
                 "problem_type": d.problem_type,
                 "confidence": d.confidence,
                 "candidate_modules": d.candidate_modules,
-                "affected_task_ids": d.affected_task_ids,
+                "affected_trace_ids": d.affected_task_ids,
                 "strategy_suggestions_count": len(d.strategy_suggestions),
                 "strategy_suggestions": d.strategy_suggestions,
                 "metadata": d.metadata,
             })
 
         stats = self._compute_diagnosis_stats(worker_details)
-        self._append_jsonl("diagnosis_details.jsonl", {
+        self._append_jsonl("diagnosis", {
             "type": "diagnosis_stats",
             "cycle": self._batch_counter,
             "num_diagnoses": len(diagnoses),
@@ -892,14 +996,14 @@ class _MetaLoopController:
             f"strategy_suggestions={stats['strategy_suggestions_total']}"
         )
 
-    def _save_planner_details(
+    def _save_planner_events(
         self,
         candidates: list,
         *,
         planned_count: int,
     ) -> None:
         """Persist planner sub-agent outputs and candidate summaries."""
-        self._append_jsonl("planner_details.jsonl", {
+        self._append_jsonl("planner", {
             "type": "planner_summary",
             "cycle": self._batch_counter,
             "planned_candidates": planned_count,
@@ -908,14 +1012,14 @@ class _MetaLoopController:
 
         if self._use_llm and hasattr(self, "_llm_planner"):
             for detail in self._llm_planner.last_subagent_details:
-                self._append_jsonl("planner_details.jsonl", {
+                self._append_jsonl("planner", {
                     "type": "planner_subagent",
                     "cycle": self._batch_counter,
                     **detail,
                 })
 
         for idx, candidate in enumerate(candidates):
-            self._append_jsonl("planner_details.jsonl", {
+            self._append_jsonl("planner", {
                 "type": "candidate",
                 "cycle": self._batch_counter,
                 "index": idx,
@@ -935,26 +1039,14 @@ class _MetaLoopController:
             })
 
     def _save_conversations(self, conversations, candidate_deltas: list[float]) -> None:
-        """Persist LLM conversations to separate JSONL files by role.
-
-        Output:
-          {log_dir}/diagnosis_conversations.jsonl  — diagnosis worker turns
-          {log_dir}/planning_conversations.jsonl   — planning LLM calls
-          {log_dir}/meta_conversations.jsonl       — all (backward compat)
-        """
+        """Persist all LLM conversations to one role-tagged JSONL file."""
         import os
         os.makedirs(self.config.log_dir, exist_ok=True)
 
-        all_path = os.path.join(self.config.log_dir, "meta_conversations.jsonl")
-        diag_path = os.path.join(self.config.log_dir, "diagnosis_conversations.jsonl")
-        plan_path = os.path.join(self.config.log_dir, "planning_conversations.jsonl")
+        conversations_path = os.path.join(self.config.log_dir, "llm_conversations.jsonl")
 
         try:
-            with (
-                open(all_path, "a", encoding="utf-8") as f_all,
-                open(diag_path, "a", encoding="utf-8") as f_diag,
-                open(plan_path, "a", encoding="utf-8") as f_plan,
-            ):
+            with open(conversations_path, "a", encoding="utf-8") as f:
                 for i, conv in enumerate(conversations):
                     reward = candidate_deltas[i] if i < len(candidate_deltas) else None
                     record = {
@@ -964,15 +1056,10 @@ class _MetaLoopController:
                         "response": conv.response[:3000],
                         "reward": reward,
                     }
-                    line = json.dumps(record, ensure_ascii=False) + "\n"
-                    f_all.write(line)
-                    if conv.role == "diagnosis":
-                        f_diag.write(line)
-                    elif conv.role == "planning":
-                        f_plan.write(line)
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
             logger.info(
                 f"Meta: saved {len(conversations)} conversations "
-                f"(diag/plan/all → {self.config.log_dir})"
+                f"(llm_conversations.jsonl → {self.config.log_dir})"
             )
         except Exception as e:
             logger.warning(f"Meta: failed to save conversations: {e}")
@@ -987,11 +1074,11 @@ class _MetaLoopController:
         best_delta: float,
         canary_report: dict[str, Any] | None = None,
     ) -> None:
-        """Append a human-readable cycle summary to {log_dir}/cycle_summary.log."""
+        """Append a human-readable cycle summary to {log_dir}/cycle_summary.md."""
         import os
         from datetime import datetime
 
-        summary_path = os.path.join(self.config.log_dir, "cycle_summary.log")
+        summary_path = os.path.join(self.config.log_dir, "cycle_summary.md")
         try:
             os.makedirs(os.path.dirname(summary_path), exist_ok=True)
             with open(summary_path, "a", encoding="utf-8") as f:
@@ -1007,7 +1094,7 @@ class _MetaLoopController:
                     f.write(
                         f"  - {d.problem_type} (conf={d.confidence:.2f})"
                         f"  modules={d.candidate_modules}"
-                        f"  tasks={d.affected_task_ids[:3]}\n"
+                        f"  traces={d.affected_task_ids[:3]}\n"
                     )
                     f.write(f"    hypothesis: {hyp[:120]}\n")
                 worker_details = getattr(self._diagnoser, "last_worker_details", []) or []
@@ -1173,6 +1260,17 @@ class _MetaLoopController:
 
         return result
 
+    def _patch_content_signature_from_dir(self, directory: str | Path) -> str:
+        """Return a stable signature of strategy/hooks content in an override dir."""
+        content = self._load_override_content_from_dir(str(directory))
+        payload = json.dumps(
+            content,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _list_patch_files_in_dir(self, directory: str) -> list[str]:
         """Return normalized patch file paths in an override directory."""
         base = Path(directory)
@@ -1230,7 +1328,7 @@ class _MetaLoopController:
 
         Strategy:
           1. Collect per-task stats (avg reward, failure count) from all traces.
-          2. If diagnoses provide affected_task_ids, prioritise those tasks.
+          2. If diagnoses provide affected trace IDs, prioritise those tasks.
           3. Among remaining failures, sort by avg reward ascending (worst first).
           4. Reserve 1 slot for a successful task (regression detection).
           5. De-duplicate by task path string.

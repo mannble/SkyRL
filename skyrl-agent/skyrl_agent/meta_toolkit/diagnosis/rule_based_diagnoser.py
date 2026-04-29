@@ -28,12 +28,12 @@ class DiagnosisResult:
 
 # Module candidates keyed by problem type
 _MODULE_MAP: dict[str, list[str]] = {
-    "timeout": ["hook:on_timeout", "hook:before_execute", "strategy_library"],
+    "timeout": ["hook:on_timeout", "strategy_library"],
     "verification_failure": ["hook:after_round", "strategy_library"],
     "termination_failure": ["hook:after_round", "strategy_library"],
     "planning_failure": ["hook:before_llm_call", "strategy_library"],
-    "context_overload": ["hook:after_execute", "hook:after_round", "strategy_library"],
-    "sync_bottleneck": ["hook:before_execute", "strategy_library"],
+    "context_overload": [],
+    "sync_bottleneck": ["strategy_library"],
     "tool_exhaustion": ["hook:before_llm_call", "strategy_library"],
     "low_reward": ["hook:after_round", "hook:before_llm_call", "strategy_library"],
     "general": ["strategy_library"],

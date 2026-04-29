@@ -81,7 +81,13 @@ class Promoter:
         self._accepted_dir = Path(self.config.accepted_patches_dir)
         self._accepted_dir.mkdir(parents=True, exist_ok=True)
 
-    def decide(self, candidate_id: str, eval_result: PatchEvalResult) -> PromotionDecision:
+    def decide(
+        self,
+        candidate_id: str,
+        eval_result: PatchEvalResult,
+        *,
+        write_record: bool = True,
+    ) -> PromotionDecision:
         """Decide whether to accept or reject a patch candidate.
 
         Returns a PromotionDecision with the reason.
@@ -130,8 +136,10 @@ class Promoter:
             metadata=asdict(eval_result),
         )
 
-        # Write accepted patch record
-        self._write_accepted_record(decision, eval_result)
+        # Write accepted patch record unless the caller is only shortlisting
+        # candidates before choosing a single best winner.
+        if write_record:
+            self._write_accepted_record(decision, eval_result)
 
         return decision
 

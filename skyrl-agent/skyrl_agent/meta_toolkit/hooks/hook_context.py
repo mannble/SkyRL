@@ -18,19 +18,19 @@ class HookContext:
 
     Fields (updated by the agent loop before each hook call):
       episode              - current round number (0-based)
-      total_episodes       - max rounds allowed
+      total_episodes       - configured round safety cap
       n_commands_executed   - total commands run so far
       n_parse_errors       - total LLM parse failures so far
       n_timeouts           - total command timeouts so far
-      last_analysis        - LLM's analysis text from this round
-      last_plan            - LLM's plan text from this round
-      last_commands        - list of command strings from this round
-      is_task_complete     - whether the LLM marked task_complete this round
+      last_analysis        - most recent parsed LLM analysis text
+      last_plan            - most recent parsed LLM plan text
+      last_commands        - most recent parsed command strings
+      is_task_complete     - most recent parsed task_complete value
       original_instruction - the original task description (read-only)
       last_terminal_output - terminal output from the most recent command execution
+      next_observation     - base message that will be shown to the agent next
       execution_history    - list of past round records (capped at 20)
       last_llm_response    - raw LLM response text before parsing
-      forced_continue_count - times force_continue was triggered by after_round hooks
       kv                   - persistent dict for cross-round state (writable)
     """
 
@@ -49,9 +49,9 @@ class HookContext:
     original_instruction: str = ""
 
     last_terminal_output: str = ""
+    next_observation: str = ""
     execution_history: list[dict[str, Any]] = field(default_factory=list)
     last_llm_response: str = ""
-    forced_continue_count: int = 0
 
     kv: dict = field(default_factory=dict)
 

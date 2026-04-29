@@ -302,15 +302,15 @@ def build_task_grouped_message(
         task_category: "partial", "all_fail", or "all_pass" -- describes the
                        target task's category for focused instructions.
     """
-    stats = get_failure_distribution(traces)
     history_text = history.format_for_prompt(5)
 
     # --- Single-task mode ---
     if target_task is not None:
         return _build_single_task_message(
-            stats, history_text, target_task, task_category,
+            history_text, target_task, task_category,
         )
 
+    stats = get_failure_distribution(traces)
     groups = group_traces_by_task(traces)
     all_fail, partial, all_pass = classify_task_groups(groups)
 
@@ -411,14 +411,12 @@ def build_task_grouped_message(
 
 
 def _build_single_task_message(
-    batch_stats: str,
     history_text: str,
     group: TaskGroup,
     category: str,
 ) -> str:
     """Build a focused user message for a single-task diagnosis worker."""
     lines: list[str] = [
-        f"## Batch context (for reference)\n{batch_stats}\n",
         f"## Recent meta-learning history\n{history_text}\n",
         f"## Your assignment: analyse task **{group.task_key}** ({category})\n",
         f"Task statistics: {group.n_success}/{group.n_total} passed, "
@@ -454,9 +452,9 @@ def _build_single_task_message(
             "This task ALWAYS FAILS across all trajectories. Investigate:\n"
             f"  1. Use inspect_trace on a few traces ({sample_ids}) to understand the failure.\n"
             "  2. Identify the root cause: is it a planning issue, timeout, "
-            "context overflow, wrong approach, etc.?\n"
+            "weak verification, repeated command failure, or wrong approach?\n"
             "  3. Submit a diagnosis with specific `root_cause_hypotheses` and "
-            "`candidate_modules` that could fix the problem.\n"
+            "affected trajectory IDs.\n"
             "  4. Do NOT submit strategy_suggestions for all-fail tasks "
             "(no successful trajectory to learn from).\n"
         )
@@ -486,18 +484,7 @@ Available diagnostic tools (call by outputting JSON):
 3. {"tool": "get_task_overview", "task_key": "<instance_id>"}
    -> Overview of all trajectories for a task (e.g. "749" shows 749-traj0..7)
 
-4. {"tool": "get_failure_distribution"}
-   -> Aggregate failure statistics for the current batch
-
-5. {"tool": "get_history", "n_cycles": 5}
-   -> View recent meta-learning cycle outcomes and which patches were accepted/rejected
-
-6. {"tool": "get_active_patches"}
-   -> View all currently active patches (YAML overrides and hook code).
-      Use this to check whether existing patches are still appropriate or
-      if they should be modified/removed in the next cycle.
-
-7. {"tool": "submit_diagnosis", "diagnoses": [...]}
+4. {"tool": "submit_diagnosis", "diagnoses": [...]}
    -> Submit your final diagnosis (required to end the session)
 
 Call ONE tool at a time. After reviewing results, call more tools or submit.
@@ -530,6 +517,5 @@ def dispatch_tool(
     else:
         return (
             f"Unknown tool: '{name}'. Available: inspect_trace, compare_traces, "
-            "get_task_overview, get_failure_distribution, get_history, "
-            "get_active_patches, submit_diagnosis"
+            "get_task_overview, submit_diagnosis"
         )

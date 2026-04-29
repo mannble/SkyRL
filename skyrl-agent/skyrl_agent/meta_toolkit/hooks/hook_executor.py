@@ -3,12 +3,14 @@
 Each hook is a small Python function with a fixed signature. Hooks are stored
 as .py files in the meta_patches directory and loaded at agent init time.
 
-Multiple hooks per hook-point are supported. They execute as a sequential
-pipeline (output of one feeds into the next) for most hook types. The
+Multiple hooks per hook-point are supported. ``before_llm_call`` hooks return
+append-only prompt guidance that is merged. ``after_execute`` and
+``on_timeout`` are observer hooks whose return values are ignored. The
 ``after_round`` hook uses independent-then-merge: each hook receives the
-original inputs and outputs are merged (`inject`, `next_prompt`, continuation).
-When multiple hooks are active at the same point, each hook receives an
-isolated ``context.kv`` namespace to avoid key conflicts.
+original inputs and outputs are merged (`next_prompt` guidance). Legacy prompt
+fields are still accepted internally for backward compatibility.
+Each generated hook group receives an isolated ``context.kv`` namespace, and
+hooks from the same group share that namespace across hook points.
 
 Safety guarantees:
   - Syntax validation before loading
@@ -50,10 +52,10 @@ class HookPoint(str, Enum):
 
 _HOOK_SIGNATURES: dict[HookPoint, str] = {
     HookPoint.BEFORE_EXECUTE: "def hook(commands: list, context: HookContext) -> list",
-    HookPoint.AFTER_EXECUTE: "def hook(terminal_output: str, context: HookContext) -> str",
-    HookPoint.ON_TIMEOUT: "def hook(command_keystrokes: str, terminal_output: str, context: HookContext) -> str",
+    HookPoint.AFTER_EXECUTE: "def hook(terminal_output: str, context: HookContext) -> None",
+    HookPoint.ON_TIMEOUT: "def hook(command_keystrokes: str, terminal_output: str, context: HookContext) -> None",
     HookPoint.ON_PARSE_ERROR: "def hook(raw_response: str, error: str, context: HookContext) -> str | None",
-    HookPoint.BEFORE_LLM_CALL: "def hook(prompt: str, context: HookContext) -> str",
+    HookPoint.BEFORE_LLM_CALL: "def hook(prompt: str, context: HookContext) -> dict | None",
     HookPoint.AFTER_ROUND: "def hook(terminal_output: str, is_task_complete: bool, context: HookContext) -> dict",
 }
 
@@ -149,6 +151,105 @@ def _validate_hook_source(source: str, point: HookPoint | None = None) -> list[s
         for name in sorted(undefined_name_errors):
             errors.append(f"Name '{name}' is used but never defined/imported")
 
+        errors.extend(_validate_context_kv_access(hook_fn))
+
+    return errors
+
+
+def _is_context_kv_attr(node: ast.AST) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "kv"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "context"
+    )
+
+
+def _kv_key_from_subscript(node: ast.Subscript) -> str | None:
+    if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+        return node.slice.value
+    return None
+
+
+def _is_kv_subscript(node: ast.AST, kv_aliases: set[str]) -> bool:
+    if not isinstance(node, ast.Subscript):
+        return False
+    value = node.value
+    return _is_context_kv_attr(value) or (
+        isinstance(value, ast.Name) and value.id in kv_aliases
+    )
+
+
+def _validate_context_kv_access(hook_fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+    """Catch likely KeyError-prone context.kv reads before canary/runtime.
+
+    This is intentionally conservative and key-based rather than path-sensitive:
+    reads are allowed when the hook contains a `setdefault`, `get`, or direct
+    assignment for the same literal key. Dynamic-key reads are rejected because
+    the smoke tests cannot reliably cover them.
+    """
+    errors: list[str] = []
+    kv_aliases: set[str] = set()
+    parent: dict[ast.AST, ast.AST] = {}
+    for node in ast.walk(hook_fn):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    for node in ast.walk(hook_fn):
+        if isinstance(node, ast.Assign) and _is_context_kv_attr(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    kv_aliases.add(target.id)
+
+    initialized_keys: set[str] = set()
+    for node in ast.walk(hook_fn):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            receiver = node.func.value
+            receiver_is_kv = _is_context_kv_attr(receiver) or (
+                isinstance(receiver, ast.Name) and receiver.id in kv_aliases
+            )
+            if receiver_is_kv and node.func.attr in {"setdefault", "get", "pop"}:
+                if node.args and isinstance(node.args[0], ast.Constant):
+                    key = node.args[0].value
+                    if isinstance(key, str):
+                        initialized_keys.add(key)
+
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if _is_kv_subscript(target, kv_aliases):
+                    key = _kv_key_from_subscript(target)
+                    if key is not None:
+                        initialized_keys.add(key)
+
+    reported: set[str] = set()
+    for node in ast.walk(hook_fn):
+        if not _is_kv_subscript(node, kv_aliases):
+            continue
+        parent_node = parent.get(node)
+
+        is_plain_assignment_target = (
+            isinstance(parent_node, ast.Assign) and node in parent_node.targets
+        ) or (
+            isinstance(parent_node, ast.AnnAssign) and node is parent_node.target
+        )
+        if is_plain_assignment_target:
+            continue
+
+        key = _kv_key_from_subscript(node)
+        if key is None:
+            errors.append(
+                "context.kv dynamic-key reads are not allowed; use get/setdefault "
+                "with a literal key"
+            )
+            continue
+        if key not in initialized_keys and key not in reported:
+            reported.add(key)
+            errors.append(
+                f"context.kv['{key}'] is read without get/setdefault/default assignment; "
+                "use context.kv.get(...) or context.kv.setdefault(...)"
+            )
+
     return errors
 
 
@@ -177,39 +278,166 @@ class _MockCommand:
 
 
 def _smoke_test_hook(fn: Callable, point: HookPoint) -> list[str]:
-    """Run a hook once with mock data. Returns list of errors (empty = OK)."""
+    """Run a hook across representative mock paths. Returns errors (empty = OK)."""
     from skyrl_agent.meta_toolkit.hooks.hook_context import HookContext
-    ctx = HookContext(
-        episode=1, total_episodes=10, original_instruction="test task",
-        last_commands=["ls -la\n", "cat README.md\n"],
-    )
+
+    def make_ctx(
+        *,
+        episode: int = 1,
+        last_commands: list[str] | None = None,
+        terminal_output: str = "",
+        is_task_complete: bool = False,
+    ) -> HookContext:
+        next_observation = terminal_output
+        if is_task_complete:
+            next_observation = (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete?"
+            )
+        return HookContext(
+            episode=episode,
+            total_episodes=10,
+            original_instruction="create the required file and verify it",
+            last_commands=last_commands or [],
+            last_terminal_output=terminal_output,
+            next_observation=next_observation,
+            is_task_complete=is_task_complete,
+        )
+
+    def check_after_round_result(result: Any, label: str) -> list[str]:
+        if not isinstance(result, dict):
+            return [f"after_round hook must return dict for {label}, got {type(result).__name__}"]
+        if "next_prompt" in result and result["next_prompt"] is not None and not isinstance(result["next_prompt"], str):
+            return [f"after_round next_prompt must be str|None for {label}"]
+        return []
 
     try:
         if point == HookPoint.BEFORE_LLM_CALL:
-            result = fn("sample terminal output\n$ ", ctx)
-            if not isinstance(result, str):
-                return [f"before_llm_call must return str, got {type(result).__name__}"]
+            for label, prompt, ctx in [
+                ("initial", "Initial task prompt", make_ctx(episode=0)),
+                ("middle", "Previous observation", make_ctx(episode=1, last_commands=["ls -la\n"])),
+                ("periodic", "Previous observation", make_ctx(episode=6, last_commands=["cat file.txt\n"])),
+            ]:
+                result = fn(prompt, ctx)
+                if result is None:
+                    continue
+                if isinstance(result, dict):
+                    append_prompt = result.get("append_prompt")
+                    if append_prompt is not None and not isinstance(append_prompt, str):
+                        return [f"before_llm_call append_prompt must be str|None for {label}"]
+                    continue
+                if isinstance(result, str):
+                    # Legacy append-only hooks returned the full prompt string.
+                    if not result.startswith(prompt):
+                        return [
+                            f"before_llm_call legacy str must keep original prompt "
+                            f"as prefix for {label}"
+                        ]
+                    continue
+                return [
+                    f"before_llm_call must return dict|None "
+                    f"(legacy str accepted) for {label}, got {type(result).__name__}"
+                ]
         elif point == HookPoint.BEFORE_EXECUTE:
-            cmds = [_MockCommand("ls -la\n", 1.0), _MockCommand("cat file.txt\n", 0.5)]
-            result = fn(cmds, ctx)
-            if not isinstance(result, list):
-                return [f"before_execute must return list, got {type(result).__name__}"]
+            for label, cmds in [
+                ("simple", [_MockCommand("ls -la\n", 1.0), _MockCommand("cat file.txt\n", 0.5)]),
+                ("empty", []),
+                ("complex", [_MockCommand("cat <<'EOF' > file.txt\nhello\nEOF\n", 1.0)]),
+            ]:
+                result = fn(cmds, make_ctx(last_commands=[c.keystrokes for c in cmds]))
+                if not isinstance(result, list):
+                    return [f"before_execute must return list for {label}, got {type(result).__name__}"]
         elif point == HookPoint.AFTER_EXECUTE:
-            result = fn("total 4\n-rw-r--r-- 1 user user 100 file.txt\n", ctx)
-            if not isinstance(result, str):
-                return [f"after_execute must return str, got {type(result).__name__}"]
+            cases = [
+                ("empty", "", []),
+                ("cat", "cat file.txt\nhello\n", ["cat file.txt\n"]),
+                ("ls", "total 4\n-rw-r--r-- 1 user user 100 file.txt\n", ["ls -la\n"]),
+                ("missing_path", "cat: missing.txt: No such file or directory\n", ["cat missing.txt\n"]),
+                ("permission", "Permission denied\n", ["touch /root/file\n"]),
+                ("large", "line\n" * 2500, ["cat big.log\n"]),
+            ]
+            shared_ctx = make_ctx()
+            for idx, (label, sample_output, commands) in enumerate(cases):
+                shared_ctx.episode = idx
+                shared_ctx.last_commands = commands
+                shared_ctx.last_terminal_output = sample_output
+                result = fn(sample_output, shared_ctx)
+                if result is not None and result != sample_output:
+                    return [
+                        f"after_execute observer must return None for {label} "
+                        "(legacy unchanged str accepted)"
+                    ]
         elif point == HookPoint.ON_TIMEOUT:
-            result = fn("long_command\n", "partial output...", ctx)
-            if not isinstance(result, str):
-                return [f"on_timeout must return str, got {type(result).__name__}"]
+            cases = [
+                ("simple", "sleep 999\n", "partial output..."),
+                ("broad_search", "find / -name target\n", "Command timed out after 60 seconds"),
+                ("install", "pip install package\n", "Collecting package...\n"),
+                ("cat_loop", "cat large.log\n", "many lines\n"),
+            ]
+            shared_ctx = make_ctx()
+            for idx, (label, command, sample_output) in enumerate(cases):
+                shared_ctx.episode = idx
+                shared_ctx.last_commands = [command]
+                shared_ctx.last_terminal_output = sample_output
+                result = fn(command, sample_output, shared_ctx)
+                if result is not None and result != sample_output:
+                    return [
+                        f"on_timeout observer must return None for {label} "
+                        "(legacy unchanged str accepted)"
+                    ]
         elif point == HookPoint.ON_PARSE_ERROR:
-            result = fn('{"bad json', "JSONDecodeError", ctx)
-            if result is not None and not isinstance(result, str):
-                return [f"on_parse_error must return str|None, got {type(result).__name__}"]
+            for label, raw_response, error in [
+                ("json", '{"bad json', "JSONDecodeError"),
+                ("empty", "", "EmptyResponse"),
+            ]:
+                result = fn(raw_response, error, make_ctx())
+                if result is not None and not isinstance(result, str):
+                    return [f"on_parse_error must return str|None for {label}, got {type(result).__name__}"]
         elif point == HookPoint.AFTER_ROUND:
-            result = fn("command output\n", False, ctx)
-            if not isinstance(result, dict):
-                return [f"after_round hook must return dict, got {type(result).__name__}"]
+            cases = [
+                ("empty", "", False, []),
+                ("empty_complete", "", True, []),
+                ("cat", "cat file.txt\nhello\n", False, ["cat file.txt\n"]),
+                ("cat_complete", "cat file.txt\nhello\n", True, ["cat file.txt\n"]),
+                ("ls_complete", "total 4\n-rw-r--r-- 1 user user 100 file.txt\n", True, ["ls -la\n"]),
+                ("missing_path", "cat: missing.txt: No such file or directory\n", False, ["cat missing.txt\n"]),
+                ("timeout", "Command timed out after 60 seconds\nfind / -name target\n", False, ["find / -name target\n"]),
+            ]
+            for idx, (label, output, complete, commands) in enumerate(cases):
+                ctx = make_ctx(
+                    episode=idx,
+                    last_commands=commands,
+                    terminal_output=output,
+                    is_task_complete=complete,
+                )
+                result = fn(output, complete, ctx)
+                errors = check_after_round_result(result, label)
+                if errors:
+                    return errors
+
+            shared_ctx = make_ctx()
+            sequence = [
+                ("cat_a", "cat a.txt\ncontent\n", False, ["cat a.txt\n"]),
+                ("cat_b", "cat b.txt\ncontent\n", False, ["cat b.txt\n"]),
+                ("ls", "total 4\n-rw-r--r-- 1 user user 10 a.txt\n", False, ["ls -la\n"]),
+                ("complete_1", "", True, []),
+                ("complete_2", "", True, []),
+            ]
+            for idx, (label, output, complete, commands) in enumerate(sequence):
+                shared_ctx.episode = idx
+                shared_ctx.last_commands = commands
+                shared_ctx.last_terminal_output = output
+                shared_ctx.next_observation = (
+                    f"Current terminal state:\n{output}\n\n"
+                    "Are you sure you want to mark the task as complete?"
+                    if complete
+                    else output
+                )
+                shared_ctx.is_task_complete = complete
+                result = fn(output, complete, shared_ctx)
+                errors = check_after_round_result(result, f"multi_round:{label}")
+                if errors:
+                    return errors
     except Exception as e:
         return [f"Runtime error: {type(e).__name__}: {e}"]
 
@@ -239,10 +467,11 @@ class HookExecutor:
     """Manages loading and execution of model-generated hooks.
 
     Supports multiple hooks per hook-point. Pipeline hooks (before_llm_call,
-    before_execute, after_execute, on_timeout, on_parse_error) chain
-    sequentially -- the output of one feeds as input to the next.
+    before_execute, on_parse_error) chain sequentially -- the output of one
+    feeds as input to the next. after_execute and on_timeout are observers:
+    each receives the original terminal output and return values are ignored.
     ``after_round`` hooks run independently on the *same* original inputs and
-    their ``inject`` texts and ``force_continue`` flags are merged.
+    their prompt guidance is merged.
 
     Usage::
 
@@ -383,7 +612,10 @@ class HookExecutor:
         if not entries:
             return args[0] if args else None
 
-        isolate_context = len(entries) > 1
+        # Always scope hook state by generated hook group. This lets sibling
+        # hooks from one group communicate across hook points while preventing
+        # unrelated groups from sharing scratch state.
+        isolate_context = True
         if point == HookPoint.AFTER_ROUND:
             return self._run_after_round_merged(
                 entries,
@@ -403,7 +635,7 @@ class HookExecutor:
         """Extract the generation group from a hook filename.
 
         Hooks produced by the same planner sub-agent share a group key like
-        ``candidate_0_hookgrp_post_action_controls``.  Hooks within the same
+        ``candidate_0_hookgrp_runtime_recovery``.  Hooks within the same
         group get a **shared** ``context.kv`` so that e.g. an after_execute
         hook can write data that a sibling after_round hook can read.
 
@@ -416,7 +648,10 @@ class HookExecutor:
         Falls back to the full hook_name if no group pattern is found.
         """
         import re as _re
-        m = _re.search(r'(candidate_\d+_hookgrp_\w+?)_[a-f0-9]{6,}$', hook_name)
+        m = _re.search(
+            r'((?:s\d+_)?candidate_\d+_hookgrp_\w+?)_[a-f0-9]{6,}$',
+            hook_name,
+        )
         if m:
             return m.group(1)
         return hook_name
@@ -471,9 +706,60 @@ class HookExecutor:
         *args,
         isolate_context: bool = False,
     ) -> Any:
-        """Sequential pipeline: first positional arg is replaced by each hook's return value."""
+        """Run pipeline hooks, or observer hooks with ignored return values."""
         current_args = list(args)
         fallback = args[0] if args else None
+
+        if point == HookPoint.BEFORE_LLM_CALL:
+            base_prompt = args[0] if args and isinstance(args[0], str) else ""
+            append_prompt_parts: list[str] = []
+            for hook_name, fn in entries:
+                try:
+                    hook_args = self._build_hook_call_args(
+                        point,
+                        hook_name,
+                        list(args),
+                        isolate_context=isolate_context,
+                    )
+                    result = fn(*hook_args)
+                    if isinstance(result, dict):
+                        append_prompt = result.get("append_prompt")
+                        if isinstance(append_prompt, str) and append_prompt:
+                            append_prompt_parts.append(append_prompt)
+                    elif isinstance(result, str) and result.startswith(base_prompt):
+                        suffix = result[len(base_prompt):]
+                        if suffix:
+                            append_prompt_parts.append(suffix)
+                    elif result is not None:
+                        logger.warning(
+                            f"Hook {point.value}/{hook_name} returned unsupported "
+                            f"{type(result).__name__}; skipping this hook"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Hook {point.value}/{hook_name} raised {type(e).__name__}: {e}; "
+                        f"skipping this hook"
+                    )
+            if append_prompt_parts:
+                return {"append_prompt": "\n\n".join(append_prompt_parts)}
+            return {}
+
+        if point in (HookPoint.AFTER_EXECUTE, HookPoint.ON_TIMEOUT):
+            for hook_name, fn in entries:
+                try:
+                    hook_args = self._build_hook_call_args(
+                        point,
+                        hook_name,
+                        list(args),
+                        isolate_context=isolate_context,
+                    )
+                    fn(*hook_args)
+                except Exception as e:
+                    logger.warning(
+                        f"Hook {point.value}/{hook_name} raised {type(e).__name__}: {e}; "
+                        f"skipping this observer hook"
+                    )
+            return fallback
 
         for hook_name, fn in entries:
             try:
@@ -499,16 +785,13 @@ class HookExecutor:
         """Independent execution for after_round: each hook gets original args.
 
         Merge strategy:
-          - Concatenate all ``inject`` texts with newline separator.
-          - ``request_new_turn``/``force_continue`` is True if any hook requests it.
-          - ``next_prompt`` supports append/replace policies:
-              * append: concatenate all append prompts
-              * replace: last replace prompt wins
+          - Concatenate all ``next_prompt`` texts with newline separator.
+          - Legacy ``inject`` and ``prompt_mode=replace`` are accepted for old
+            hooks; the Terminus runtime applies guidance in append mode.
         """
         merged_inject_parts: list[str] = []
         append_prompt_parts: list[str] = []
         replace_prompt: str | None = None
-        request_new_turn = False
 
         for hook_name, fn in entries:
             try:
@@ -532,9 +815,6 @@ class HookExecutor:
                         replace_prompt = next_prompt
                     else:
                         append_prompt_parts.append(next_prompt)
-
-                if result.get("request_new_turn") or result.get("force_continue"):
-                    request_new_turn = True
             except Exception as e:
                 logger.warning(
                     f"Hook after_round/{hook_name} raised {type(e).__name__}: {e}; skipping"
@@ -551,10 +831,6 @@ class HookExecutor:
             merged["next_prompt"] = "\n\n".join(append_prompt_parts)
             merged["prompt_mode"] = "append"
 
-        if request_new_turn:
-            merged["request_new_turn"] = True
-            # Backward-compatible alias.
-            merged["force_continue"] = True
         return merged
 
     def to_dict(self) -> dict[str, str]:

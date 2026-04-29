@@ -12,6 +12,7 @@ Only partial-task workers are required to produce ``strategy_suggestions``.
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import json
 import logging
 import re
@@ -24,7 +25,6 @@ from skyrl_agent.meta_toolkit.diagnosis.diagnosis_tools import (
     build_task_grouped_message,
     classify_task_groups,
     dispatch_tool,
-    get_failure_distribution,
     group_traces_by_task,
 )
 from skyrl_agent.meta_toolkit.diagnosis.rule_based_diagnoser import (
@@ -60,46 +60,39 @@ You are an expert AI-agent performance analyst conducting an interactive
 diagnosis session. You will examine execution traces from a terminal-based
 AI agent and identify failure patterns.
 
-## Patchable modules
-
-| Module | Responsibility |
-|--------|---------------|
-| strategy_library | Pattern-matched step-by-step strategies (prompt injection) |
-| hook:before_llm_call | Modify prompt before each LLM call |
-| hook:before_execute | Filter or modify commands before execution |
-| hook:after_execute | Process terminal output after command execution |
-| hook:on_timeout | Handle command timeouts |
-| hook:after_round | Post-round control: verify completion, detect loops, force extra LLM turns |
-
 ## Workflow
 
-1. You will receive a statistical summary of the current batch.
+1. You will receive one focused task-group assignment.
 2. Use the diagnostic tools to investigate specific traces.
-3. Compare successful and failed traces to find patterns.
+3. Compare successful and failed traces to find patterns when available.
 4. Check history to avoid repeating past failed patches.
-5. When ready, submit your diagnosis.
+5. When ready, submit your diagnosis. The downstream planner will decide
+   whether each diagnosis should become a strategy edit or a runtime hook.
 
 {tool_descriptions}
 
+{diagnosis_format}
+"""
+
+_DIAGNOSIS_FORMAT_WITH_STRATEGIES = """\
 ## Diagnosis format (for submit_diagnosis)
 
 ```json
-{{"tool": "submit_diagnosis", "diagnoses": [
-  {{
+{"tool": "submit_diagnosis", "diagnoses": [
+  {
     "problem_type": "<string>",
     "root_cause_hypotheses": ["<specific evidence-based hypothesis>"],
-    "candidate_modules": ["<module_name>"],
     "confidence": <0.0-1.0>,
-    "affected_task_ids": ["<task_id>"],
+    "affected_trace_ids": ["<trajectory_id, e.g. 749-traj3>"],
     "strategy_suggestions": [
-      {{
+      {
         "pattern": "<when to apply this strategy — a recognizable situation>",
         "steps": ["<step 1>", "<step 2>", "..."],
         "source": "<evidence: e.g. 'task 749-traj3 succeeded by doing X'>"
-      }}
+      }
     ]
-  }}
-]}}
+  }
+]}
 ```
 
 `strategy_suggestions` is optional but highly valuable. When you compare
@@ -109,8 +102,31 @@ trace did differently as a reusable strategy. Each strategy should have:
 - `steps`: concrete step-by-step actions the agent should take
 - `source`: which trace/task provided the evidence
 
-Be specific — reference concrete task IDs, turn counts, and tool patterns.
+Be specific — reference concrete trajectory IDs, turn counts, and tool patterns.
 Do NOT just say "context_overload" without evidence of what causes it.
+"""
+
+_DIAGNOSIS_FORMAT_DIAGNOSIS_ONLY = """\
+## Diagnosis format (for submit_diagnosis)
+
+```json
+{"tool": "submit_diagnosis", "diagnoses": [
+  {
+    "problem_type": "<string>",
+    "root_cause_hypotheses": ["<specific evidence-based hypothesis>"],
+    "confidence": <0.0-1.0>,
+    "affected_trace_ids": ["<trajectory_id, e.g. 749-traj3>"]
+  }
+]}
+```
+
+For diagnosis-only workers such as all-fail or all-pass tasks, do NOT include
+`strategy_suggestions`; there is no contrastive successful-vs-failed pair to
+imitate. The downstream planner can still decide whether the diagnosis calls
+for a hook or a strategy.
+
+Be specific — reference concrete trajectory IDs, turn counts, commands, and
+observed failure modes. Do NOT just say "context_overload" without evidence.
 """
 
 _FORCE_SUBMIT_MSG = (
@@ -118,6 +134,19 @@ _FORCE_SUBMIT_MSG = (
     "findings so far. Summarize what you have observed and submit a diagnosis, "
     "even if your investigation is incomplete."
 )
+
+
+def _build_system_prompt(task_category: str) -> str:
+    diagnosis_format = (
+        _DIAGNOSIS_FORMAT_WITH_STRATEGIES
+        if task_category == "partial"
+        else _DIAGNOSIS_FORMAT_DIAGNOSIS_ONLY
+    )
+    return (
+        _SYSTEM_PROMPT
+        .replace("{tool_descriptions}", TOOL_DESCRIPTIONS)
+        .replace("{diagnosis_format}", diagnosis_format)
+    )
 
 
 def _extract_tool_call(text: str) -> dict[str, Any] | None:
@@ -572,7 +601,7 @@ class InteractiveDiagnoser:
         """
         self._client.set_role("diagnosis")
 
-        system_prompt = _SYSTEM_PROMPT.format(tool_descriptions=TOOL_DESCRIPTIONS)
+        system_prompt = _build_system_prompt(task_category)
         user_msg = build_task_grouped_message(
             traces, self._history,
             target_task=target_task,
@@ -706,16 +735,12 @@ class InteractiveDiagnoser:
             hypotheses.append("No clear failure pattern identified")
 
         problem_type = "context_overload" if ctx_traces else "task_failure"
-        modules = ["hook:before_llm_call", "strategy_library"]
-        if ctx_traces:
-            modules.append("hook:after_round")
-
         affected = [t.task_id for t in fail_traces[:5]]
 
         return [DiagnosisResult(
             problem_type=problem_type,
             root_cause_hypotheses=hypotheses,
-            candidate_modules=modules,
+            candidate_modules=[],
             confidence=0.4,
             affected_task_ids=affected,
             metadata={
@@ -729,38 +754,112 @@ class InteractiveDiagnoser:
     def _merge_diagnoses(diagnoses: list[DiagnosisResult]) -> list[DiagnosisResult]:
         """Merge and deduplicate diagnoses from multiple workers.
 
-        Strategy suggestions from partial-task workers are given priority and
-        always preserved in the merge.
+        Every worker's evidence is preserved.  Results are grouped by
+        ``problem_type`` to keep the downstream planner prompt organized, but
+        the merged diagnosis carries all hypotheses, affected trace IDs,
+        allowed strategy suggestions, and per-worker summaries from that group.
+
+        The merged confidence is the maximum confidence among the workers in
+        the group.  This is conservative: agreement adds evidence via merged
+        hypotheses/metadata, but does not inflate the numeric confidence.
         """
-        seen_types: dict[str, DiagnosisResult] = {}
+        grouped: dict[str, list[DiagnosisResult]] = {}
         for d in diagnoses:
             # Hard guard: only partial-task workers can contribute strategy suggestions.
-            if d.metadata.get("task_category") != "partial":
-                d.strategy_suggestions = []
+            suggestions = (
+                d.strategy_suggestions
+                if d.metadata.get("task_category") == "partial"
+                else []
+            )
 
-            key = d.problem_type
-            if key not in seen_types or d.confidence > seen_types[key].confidence:
-                seen_types[key] = d
-            else:
-                existing = seen_types[key]
+            problem_type = str(d.problem_type or "general").strip() or "general"
+            grouped.setdefault(problem_type, []).append(
+                DiagnosisResult(
+                    problem_type=problem_type,
+                    root_cause_hypotheses=list(d.root_cause_hypotheses),
+                    candidate_modules=list(d.candidate_modules),
+                    confidence=float(d.confidence),
+                    affected_task_ids=list(d.affected_task_ids),
+                    metadata=dict(d.metadata),
+                    strategy_suggestions=deepcopy(suggestions),
+                )
+            )
+
+        merged: list[DiagnosisResult] = []
+        for problem_type, items in grouped.items():
+            hypotheses: list[str] = []
+            affected: list[str] = []
+            modules: list[str] = []
+            strategy_suggestions: list[dict[str, Any]] = []
+            seen_suggestion_keys: set[str] = set()
+            worker_evidence: list[dict[str, Any]] = []
+            confidence = max((d.confidence for d in items), default=0.0)
+
+            for d in items:
                 for h in d.root_cause_hypotheses:
-                    if h not in existing.root_cause_hypotheses:
-                        existing.root_cause_hypotheses.append(h)
-                for m in d.candidate_modules:
-                    if m not in existing.candidate_modules:
-                        existing.candidate_modules.append(m)
+                    if h not in hypotheses:
+                        hypotheses.append(h)
                 for tid in d.affected_task_ids:
-                    if tid not in existing.affected_task_ids:
-                        existing.affected_task_ids.append(tid)
-                for s in d.strategy_suggestions:
-                    existing_patterns = {
-                        ss.get("pattern", "").lower().strip()
-                        for ss in existing.strategy_suggestions
-                    }
-                    if s.get("pattern", "").lower().strip() not in existing_patterns:
-                        existing.strategy_suggestions.append(s)
+                    if tid not in affected:
+                        affected.append(tid)
+                for module in d.candidate_modules:
+                    if module not in modules:
+                        modules.append(module)
 
-        merged = sorted(seen_types.values(), key=lambda d: d.confidence, reverse=True)
+                for suggestion in d.strategy_suggestions:
+                    if not isinstance(suggestion, dict):
+                        continue
+                    suggestion_key = json.dumps(
+                        suggestion,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    if suggestion_key in seen_suggestion_keys:
+                        continue
+                    seen_suggestion_keys.add(suggestion_key)
+                    strategy_suggestions.append(deepcopy(suggestion))
+
+                worker_evidence.append({
+                    "worker_name": d.metadata.get("worker_name", ""),
+                    "task_category": d.metadata.get("task_category", ""),
+                    "confidence": d.confidence,
+                    "affected_trace_ids": list(d.affected_task_ids),
+                    "root_cause_hypotheses": list(d.root_cause_hypotheses),
+                    "analysis_summary": d.metadata.get("analysis_summary", ""),
+                    "strategy_suggestions": deepcopy(d.strategy_suggestions),
+                })
+
+            summary_parts: list[str] = []
+            for evidence in worker_evidence:
+                summary = str(evidence.get("analysis_summary") or "").strip()
+                if not summary:
+                    continue
+                worker = evidence.get("worker_name") or "unknown_worker"
+                category = evidence.get("task_category") or "unknown_category"
+                conf = evidence.get("confidence", 0.0)
+                summary_parts.append(f"{worker} [{category}, conf={conf:.2f}]: {summary}")
+
+            merged.append(
+                DiagnosisResult(
+                    problem_type=problem_type,
+                    root_cause_hypotheses=hypotheses,
+                    candidate_modules=modules,
+                    confidence=confidence,
+                    affected_task_ids=affected,
+                    metadata={
+                        "source": "merged_interactive_llm",
+                        "merged_count": len(items),
+                        "confidence_policy": "max_worker_confidence",
+                        "merged_confidences": [d.confidence for d in items],
+                        "analysis_summary": "\n".join(summary_parts),
+                        "worker_evidence": worker_evidence,
+                    },
+                    strategy_suggestions=strategy_suggestions,
+                )
+            )
+
+        merged = sorted(merged, key=lambda d: d.confidence, reverse=True)
         return merged
 
     @staticmethod
@@ -783,9 +882,12 @@ class InteractiveDiagnoser:
                 DiagnosisResult(
                     problem_type=obj.get("problem_type", "general"),
                     root_cause_hypotheses=obj.get("root_cause_hypotheses", []),
-                    candidate_modules=obj.get("candidate_modules", ["strategy_library"]),
+                    candidate_modules=[],
                     confidence=float(obj.get("confidence", 0.5)),
-                    affected_task_ids=obj.get("affected_task_ids", []),
+                    affected_task_ids=(
+                        obj.get("affected_trace_ids")
+                        or obj.get("affected_task_ids", [])
+                    ),
                     metadata={"source": "interactive_llm", "task_category": task_category},
                     strategy_suggestions=valid_suggestions,
                 )
@@ -793,7 +895,7 @@ class InteractiveDiagnoser:
         return results if results else [DiagnosisResult(
             problem_type="general",
             root_cause_hypotheses=["Interactive session did not produce clear diagnosis"],
-            candidate_modules=["strategy_library"],
+            candidate_modules=[],
             confidence=0.3,
             affected_task_ids=[],
             metadata={"source": "interactive_llm_fallback"},
